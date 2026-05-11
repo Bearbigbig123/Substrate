@@ -1420,8 +1420,20 @@ def process_single_chart(chart_info, raw_df, initial_baseline_start_date, baseli
         print(f"  DEBUG: 基線時間範圍 - 從 {actual_baseline_start_date} 到 {baseline_end_date}")
         print(f"  DEBUG: 當週時間範圍 - 從 {weekly_start_date} 到 {weekly_end_date}")
         print(f"  DEBUG: 基線結束與當週開始間隔 = {weekly_start_date - baseline_end_date}")
-        # 計算當週數據是否創下歷史新高或新低
-        record_results = record_high_low_calculator(weekly_data['point_val'].values, baseline_data['point_val'].values) if not baseline_insufficient and not baseline_empty else {'highlight_status': 'NO_HIGHLIGHT', 'record_high': False, 'record_low': False}
+        # 計算當週數據是否創下歷史新高或新低（基線先過濾 OOC 點）
+        if not baseline_insufficient and not baseline_empty:
+            _ucl = chart_info.get('UCL')
+            _lcl = chart_info.get('LCL')
+            _baseline_for_record = baseline_data.copy()
+            if _ucl is not None and not pd.isna(_ucl):
+                _baseline_for_record = _baseline_for_record[_baseline_for_record['point_val'] <= _ucl]
+            if _lcl is not None and not pd.isna(_lcl):
+                _baseline_for_record = _baseline_for_record[_baseline_for_record['point_val'] >= _lcl]
+            if _baseline_for_record.empty:
+                _baseline_for_record = baseline_data  # fallback：若全部被過濾則還原
+            record_results = record_high_low_calculator(weekly_data['point_val'].values, _baseline_for_record['point_val'].values)
+        else:
+            record_results = {'highlight_status': 'NO_HIGHLIGHT', 'record_high': False, 'record_low': False}
         print(f"  record_high_low_calculator 返回: {record_results}")
 
         # 判斷是否需要 highlight (任何一個子指標需要高亮，則總體高亮)
@@ -3504,9 +3516,19 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
                 print(f" - DEBUG: 基線時間範圍 - 從 {actual_baseline_start_date} 到 {baseline_end_date}")
                 print(f" - DEBUG: 當週時間範圍 - 從 {weekly_start_date} 到 {weekly_end_date}")
                 print(f" - DEBUG: 基線結束與當週開始間隔 = {weekly_start_date - baseline_end_date}")
+                # 基線先過濾 OOC 點再進行 record high/low 比較
+                _ucl_d = chart_info.get('UCL')
+                _lcl_d = chart_info.get('LCL')
+                _baseline_for_record_d = baseline_data.copy()
+                if _ucl_d is not None and not pd.isna(_ucl_d):
+                    _baseline_for_record_d = _baseline_for_record_d[_baseline_for_record_d['point_val'] <= _ucl_d]
+                if _lcl_d is not None and not pd.isna(_lcl_d):
+                    _baseline_for_record_d = _baseline_for_record_d[_baseline_for_record_d['point_val'] >= _lcl_d]
+                if _baseline_for_record_d.empty:
+                    _baseline_for_record_d = baseline_data  # fallback：若全部被過濾則還原
                 record_results = record_high_low_calculator(
-                    weekly_data['point_val'].values, 
-                    baseline_data['point_val'].values
+                    weekly_data['point_val'].values,
+                    _baseline_for_record_d['point_val'].values
                 )
                 
                 # === 更新結果 ===

@@ -194,6 +194,7 @@ class ProcessSummary(BaseModel):
 class ResultItem(BaseModel):
     data_cnt: Optional[int] = None
     ooc_cnt: Optional[int] = None
+    oos_cnt: Optional[int] = None
     WE_Rule: Optional[str] = None
     OOB_Rule: Optional[str] = None
     data_type: Optional[str] = None
@@ -811,6 +812,23 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
     except Exception:
         result["chart_data"] = []
 
+    # 計算 weekly OOS 計數（weekly 窗口內出現於完整資料但被 OOS 過濾掉的點）
+    try:
+        if plot_df is not None and not plot_df.empty:
+            _weekly_all = _plot_df[
+                (_plot_df["point_time"] >= weekly_start_date) & (_plot_df["point_time"] <= weekly_end_date)
+            ]
+            _weekly_raw_times = set(
+                raw_df[
+                    (raw_df["point_time"] >= weekly_start_date) & (raw_df["point_time"] <= weekly_end_date)
+                ]["point_time"]
+            )
+            result["oos_cnt"] = int((~_weekly_all["point_time"].isin(_weekly_raw_times)).sum())
+        else:
+            result["oos_cnt"] = 0
+    except Exception:
+        result["oos_cnt"] = 0
+
     return _build_result_api(result, violated_rules, image_path, weekly_image_path, qq_plot_path)
 
 
@@ -1320,7 +1338,16 @@ def _spc_cpk_worker(args):
         for k in ['mean_current', 'sigma_current', 'mean_last_month', 'sigma_last_month', 'mean_last2_month', 'sigma_last2_month']:
             if mean_stats.get(k) is None and cpk_res.get(k) is not None:
                 mean_stats[k] = cpk_res[k]
-        chart_image = cpk_eng.generate_spc_chart_base64(raw_df, chart_info_dict, start_date, end_date, custom_mode)
+        # 計算 violation 標記供圖片 title 使用
+        _r1v = metrics.get('r1'); _r2v = metrics.get('r2')
+        def _h(v, thr):
+            try: return float(v) >= thr if v is not None else False
+            except: return False
+        _viol = ("H(R1+R2)" if _h(_r1v, 25) and _h(_r2v, 20) else
+                 "H(R1)"    if _h(_r1v, 25) else
+                 "H(R2)"    if _h(_r2v, 20) else "")
+        metrics_for_title = {**metrics, 'violation': _viol}
+        chart_image = cpk_eng.generate_spc_chart_base64(raw_df, chart_info_dict, start_date, end_date, custom_mode, metrics=metrics_for_title)
         def san(x): return None if isinstance(x, float) and (math.isnan(x) or math.isinf(x)) else x
         return {
             'group_name': group_name, 'chart_name': chart_name,
@@ -1458,7 +1485,7 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
             try:
                 results_df = pd.DataFrame(results)
                 expected_cols = [
-                    "data_cnt", "ooc_cnt", "WE_Rule", "OOB_Rule", "data_type", "Material_no", "group_name",
+                    "data_cnt", "ooc_cnt", "oos_cnt", "WE_Rule", "OOB_Rule", "data_type", "Material_no", "group_name",
                     "chart_name", "chart_ID", "Characteristics", "USL", "LSL", "UCL", "LCL", "Target",
                     "Cpk", "Resolution", "HL_record_high_low", "record_high", "record_low",
                     "chart_path", "weekly_chart_path", "qq_plot_path"

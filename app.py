@@ -379,6 +379,22 @@ def generate_full_excel_with_images(data_list, mode):
     is_cpk_mode = mode == "CPK Dashboard"
     is_tm_mode  = mode == "Tool Matching"
 
+    # CPK 違規計算與格式
+    violation_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 10, 'bg_color': '#FFD0D0'})
+    if is_cpk_mode and ('r1' in df.columns or 'r2' in df.columns):
+        def _excel_cpk_viol(row):
+            try: r1f = float(row.get('r1')) if row.get('r1') is not None and pd.notna(row.get('r1')) else None
+            except: r1f = None
+            try: r2f = float(row.get('r2')) if row.get('r2') is not None and pd.notna(row.get('r2')) else None
+            except: r2f = None
+            h1 = r1f is not None and r1f >= 25
+            h2 = r2f is not None and r2f >= 20
+            if h1 and h2: return "H(R1+R2)"
+            if h1: return "H(R1)"
+            if h2: return "H(R2)"
+            return ""
+        df['cpk_violation'] = df.apply(_excel_cpk_viol, axis=1)
+
     # OOB: 5 張圖表欄位
     img_fields = [
         ('chart_path', 'Total SPC'),
@@ -485,13 +501,15 @@ def generate_full_excel_with_images(data_list, mode):
                         worksheet.write(excel_row, col_offset, "Image Error", cell_format)
 
         # 寫入文字數據
+        _cpk_v = row.get('cpk_violation', '') if 'cpk_violation' in df.columns else ''
+        _row_fmt = violation_format if (is_cpk_mode and str(_cpk_v) not in ['', 'nan', 'NaN', 'None']) else cell_format
         for i, col_name in enumerate(data_cols):
             val = row.get(col_name)
             if pd.isna(val):
                 val = ""
             elif isinstance(val, (list, dict)):
                 val = str(val)
-            worksheet.write(excel_row, start_col + i, val, cell_format)
+            worksheet.write(excel_row, start_col + i, val, _row_fmt)
             col_widths[start_col + i] = max(col_widths.get(start_col + i, 12), len(str(val)) + 2)
 
     # 設定寬度與高度
@@ -778,6 +796,28 @@ if st.session_state.results:
         else:
             df_processed = df_summary.copy()
 
+        # CPK 模式：計算 R1/R2 違規欄位
+        if st.session_state.current_mode == "CPK Dashboard":
+            def _cpk_viol(row):
+                try:
+                    r1v = row.get('r1')
+                    r1f = float(r1v) if r1v is not None and pd.notna(r1v) and str(r1v) not in ['nan', 'NaN', '', '-'] else None
+                except Exception:
+                    r1f = None
+                try:
+                    r2v = row.get('r2')
+                    r2f = float(r2v) if r2v is not None and pd.notna(r2v) and str(r2v) not in ['nan', 'NaN', '', '-'] else None
+                except Exception:
+                    r2f = None
+                h1 = r1f is not None and r1f >= 25
+                h2 = r2f is not None and r2f >= 20
+                if h1 and h2: return "H(R1+R2)"
+                if h1: return "H(R1)"
+                if h2: return "H(R2)"
+                return ""
+            if 'r1' in df_processed.columns or 'r2' in df_processed.columns:
+                df_processed['cpk_violation'] = df_processed.apply(_cpk_viol, axis=1)
+
         c_top_left, c_top_right = st.columns([1.6, 2.4], gap="small")
         
         with c_top_left:
@@ -800,8 +840,34 @@ if st.session_state.results:
                     use_container_width=True
                 )
             
+            # --- 任務摘要統計列 ---
+            _mode_now = st.session_state.get("current_mode", "")
+            if _mode_now == "OOB/SPC":
+                _total = len(data_list)
+                _oos_n = sum(1 for r in data_list if (r.get("oos_cnt") or 0) > 0)
+                _ooc_n = sum(1 for r in data_list if (r.get("ooc_cnt") or 0) > 0)
+                _oob_n = sum(1 for r in data_list if r.get("OOB_Rule") not in [None, "", "N/A", "-", "nan", "NaN"])
+                _we_n  = sum(1 for r in data_list if r.get("WE_Rule")  not in [None, "", "N/A", "-", "nan", "NaN"])
+                st.dataframe(pd.DataFrame({
+                    "Total": [_total], "OOS>0": [_oos_n], "OOC>0": [_ooc_n],
+                    "OOB Violations": [_oob_n], "WE Violations": [_we_n],
+                }), hide_index=True, use_container_width=True)
+            elif _mode_now == "Tool Matching":
+                _total = len(data_list)
+                _abn_n = sum(1 for r in data_list if r.get("need_matching") or r.get("abnormal_type") not in [None, "", "nan", "NaN"])
+                st.dataframe(pd.DataFrame({"Total": [_total], "Abnormal": [_abn_n]}), hide_index=True, use_container_width=True)
+            elif _mode_now == "CPK Dashboard":
+                def _sf(v):
+                    try: return float(v) if v not in [None, '', 'nan', 'NaN'] else 0.0
+                    except: return 0.0
+                _total = len(data_list)
+                _r1_n = sum(1 for r in data_list if _sf((r.get('metrics') or {}).get('r1') or r.get('r1')) >= 25)
+                _r2_n = sum(1 for r in data_list if _sf((r.get('metrics') or {}).get('r2') or r.get('r2')) >= 20)
+                _both = sum(1 for r in data_list if _sf((r.get('metrics') or {}).get('r1') or r.get('r1')) >= 25 and _sf((r.get('metrics') or {}).get('r2') or r.get('r2')) >= 20)
+                st.dataframe(pd.DataFrame({"Total": [_total], "R1 Viol.(≥25%)": [_r1_n], "R2 Viol.(≥20%)": [_r2_n], "Both": [_both]}), hide_index=True, use_container_width=True)
+
             # --- 💡 資料清洗與自動置頂邏輯 ---
-            keep_list = ['gname', 'cname', 'group', 'group_name', 'chart_name', 'Characteristics', 'characteristics', 'WE_Rule', 'OOB_Rule', 'abnormal_type', 'cpk', 'cpk_l1', 'cpk_l2', 'r1', 'r2', 'k_value', 'mean_index', 'sigma_index', 'data_cnt']
+            keep_list = ['gname', 'cname', 'group', 'group_name', 'chart_name', 'Characteristics', 'characteristics', 'WE_Rule', 'OOB_Rule', 'ooc_cnt', 'oos_cnt', 'abnormal_type', 'cpk', 'cpk_l1', 'cpk_l2', 'r1', 'r2', 'cpk_violation', 'k_value', 'mean_index', 'sigma_index', 'data_cnt']
             existing_cols = [c for c in keep_list if c in df_processed.columns]
             display_df = df_processed[existing_cols].copy()
             
@@ -826,7 +892,8 @@ if st.session_state.results:
             has_we = (display_df['WE_Rule'] != "") if 'WE_Rule' in display_df.columns else pd.Series(False, index=display_df.index)
             has_oob = (display_df['OOB_Rule'] != "") if 'OOB_Rule' in display_df.columns else pd.Series(False, index=display_df.index)
             has_tm = (display_df['abnormal_type'] != "") if 'abnormal_type' in display_df.columns else pd.Series(False, index=display_df.index)
-            display_df['has_issue'] = has_we | has_oob | has_tm
+            has_cpk_viol = (display_df['cpk_violation'] != "") if 'cpk_violation' in display_df.columns else pd.Series(False, index=display_df.index)
+            display_df['has_issue'] = has_we | has_oob | has_tm | has_cpk_viol
             
             _sort_candidates = ['has_issue', 'group_name', 'gname', 'chart_name', 'cname']
             _sort_cols = [c for c in _sort_candidates if c in display_df.columns]
@@ -868,7 +935,10 @@ if st.session_state.results:
                 "cpk_l2": {"header_name": "Cpk L2", "width": 70},
                 "r1": {"header_name": "R1", "width": 65},
                 "r2": {"header_name": "R2", "width": 65},
+                "cpk_violation": {"header_name": "Violation", "width": 90},
                 "k_value": {"header_name": "K Value", "width": 80},
+                "ooc_cnt": {"header_name": "OOC", "width": 60},
+                "oos_cnt": {"header_name": "OOS", "width": 60},
                 "mean_index": {"header_name": "Mean Idx", "width": 90},
                 "sigma_index": {"header_name": "Sigma Idx", "width": 90},
                 "data_cnt": {"header_name": "N", "width": 70}
@@ -1170,9 +1240,9 @@ if st.session_state.results:
                                 )
                                 st.plotly_chart(fig, use_container_width=True)
                             except Exception:
-                                st.image(item['chart_path'], use_container_width=True)
+                                with open(item['chart_path'], 'rb') as _f: st.image(_f.read(), use_container_width=True)
                         else:
-                            st.image(item['chart_path'], use_container_width=True)
+                            with open(item['chart_path'], 'rb') as _f: st.image(_f.read(), use_container_width=True)
                     else:
                         st.info("無主圖資料")
                 elif st.session_state.current_mode == "CPK Dashboard" and item.get('chart_image'):
@@ -1181,7 +1251,7 @@ if st.session_state.results:
                 elif st.session_state.current_mode == "Tool Matching":
                     spc_path = item.get('spc_chart_path')
                     if spc_path and os.path.exists(spc_path):
-                        st.image(spc_path, use_container_width=True)
+                        with open(spc_path, 'rb') as _f: st.image(_f.read(), use_container_width=True)
                     else:
                         st.info("此項目無 SPC 圖表。")
             else:
@@ -1206,7 +1276,7 @@ if st.session_state.results:
                 ("**By Tool Group SPC**", item.get('by_tool_group_path')),
                 ("**Q-Q Plot**", item.get('qq_plot_path'))
             ]
-            valid_rest_charts = [(title, path) for title, path in rest_charts if path]
+            valid_rest_charts = [(title, path) for title, path in rest_charts if path and os.path.exists(path)]
             
             if valid_rest_charts:
                 st.divider()
@@ -1215,11 +1285,11 @@ if st.session_state.results:
                     bottom_cols = st.columns(2)
                     with bottom_cols[0]:
                         st.markdown(valid_rest_charts[i][0])
-                        st.image(valid_rest_charts[i][1], use_container_width=True)
+                        with open(valid_rest_charts[i][1], 'rb') as _f: st.image(_f.read(), use_container_width=True)
                     if i + 1 < len(valid_rest_charts):
                         with bottom_cols[1]:
                             st.markdown(valid_rest_charts[i+1][0])
-                            st.image(valid_rest_charts[i+1][1], use_container_width=True)
+                            with open(valid_rest_charts[i+1][1], 'rb') as _f: st.image(_f.read(), use_container_width=True)
 
         elif item and st.session_state.current_mode == "Tool Matching":
             tl_path = item.get('timeline_chart_path')
@@ -1235,7 +1305,7 @@ if st.session_state.results:
                 for col, (title, path) in zip(bottom_cols, charts_to_show):
                     with col:
                         st.markdown(title)
-                        st.image(path, use_container_width=True)
+                        with open(path, 'rb') as _f: st.image(_f.read(), use_container_width=True)
 else:
     if st.session_state.status == "idle":
         st.markdown("<h3 style='text-align: center; color: #888; padding-top: 100px;'>點擊左上角 Settings 開始分析</h3>", unsafe_allow_html=True)

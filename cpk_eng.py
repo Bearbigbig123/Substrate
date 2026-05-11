@@ -350,7 +350,7 @@ def _draw_box_plot_api(ax, plot_df, chart_info):
             patch.set_facecolor(colors[i % len(colors)])
             patch.set_alpha(0.8)
         ax.set_xticklabels(labels, rotation=0, ha='center', fontsize=9)
-        ax.set_xlabel(tool_col, fontsize=8)
+        ax.set_xlabel('')
     else:
         y = plot_df['point_val'].values
         if len(y) == 0:
@@ -408,7 +408,7 @@ def _draw_qq_plot_api(ax, plot_df, chart_info):
     ax.tick_params(axis='both', which='major', labelsize=8)
 
 
-def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date: Optional[date] = None, end_date: Optional[date] = None, custom_mode: bool = False) -> str:
+def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date: Optional[date] = None, end_date: Optional[date] = None, custom_mode: bool = False, metrics: Optional[dict] = None) -> str:
     fig = plt.figure(figsize=(12, 6))
     gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1], hspace=0.3, wspace=0.25)
     ax_main = fig.add_subplot(gs[:, 0])
@@ -421,14 +421,27 @@ def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date
         ax_qq.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_qq.transAxes)
     else:
         plot_df = raw_df.copy()
-        if start_date and end_date and 'point_time' in plot_df.columns:
+        if 'point_time' in plot_df.columns:
             try:
                 plot_df['point_time'] = pd.to_datetime(plot_df['point_time'])
-                start_ts = pd.to_datetime(start_date)
-                end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-                filtered = plot_df[(plot_df['point_time'] >= start_ts) & (plot_df['point_time'] <= end_ts)]
-                if not filtered.empty: plot_df = filtered
-            except Exception: pass
+                if custom_mode and start_date and end_date:
+                    # custom 模式：用使用者指定的日期範圍
+                    start_ts = pd.to_datetime(start_date)
+                    end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+                    filtered = plot_df[(plot_df['point_time'] >= start_ts) & (plot_df['point_time'] <= end_ts)]
+                    if not filtered.empty:
+                        plot_df = filtered
+                elif end_date:
+                    # 非 custom 模式：以 min(end_date, tmax) 為基準倒推 3M
+                    # 確保 L0/L1/L2 三個色塊都落在繪圖資料範圍內
+                    end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+                    end_actual = min(end_ts, plot_df['point_time'].max())
+                    start_actual = end_actual - pd.DateOffset(months=3)
+                    filtered = plot_df[plot_df['point_time'] >= start_actual]
+                    if not filtered.empty:
+                        plot_df = filtered
+            except Exception:
+                pass
         
         if not plot_df.empty:
             _draw_main_spc_chart_api(ax_main, plot_df, chart_info, start_date, end_date, custom_mode)
@@ -438,7 +451,56 @@ def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date
     group_name = chart_info.get('GroupName', '')
     chart_name = chart_info.get('ChartName', '')
     characteristics = chart_info.get('Characteristics', '')
-    ax_main.set_title(f"{group_name}@{chart_name}@{characteristics}", pad=18, fontsize=12)
+
+    # --- 組合多行 title ---
+    def _sf(v):
+        try:
+            f = float(v)
+            return None if (f != f) else f  # NaN guard
+        except (TypeError, ValueError):
+            return None
+
+    _line1 = f"{group_name} / {chart_name}" + (f" / {characteristics}" if characteristics else "")
+
+    _m = metrics or {}
+    _cpk   = _sf(_m.get('cpk'))
+    _cpk_l1 = _sf(_m.get('cpk_l1'))
+    _cpk_l2 = _sf(_m.get('cpk_l2'))
+    _r1    = _sf(_m.get('r1'))
+    _r2    = _sf(_m.get('r2'))
+    _viol  = str(_m.get('violation', '') or '').strip()
+
+    _line2_parts = []
+    if _cpk    is not None: _line2_parts.append(f"Cpk(L0): {_cpk:.3f}")
+    if _cpk_l1 is not None: _line2_parts.append(f"Cpk(L1): {_cpk_l1:.3f}")
+    if _cpk_l2 is not None: _line2_parts.append(f"Cpk(L2): {_cpk_l2:.3f}")
+
+    _line3_parts = []
+    if _r1 is not None: _line3_parts.append(f"R1: {_r1:.1f}%")
+    if _r2 is not None: _line3_parts.append(f"R2: {_r2:.1f}%")
+    if _viol and _viol not in ['-', 'nan', 'None']: _line3_parts.append(f"⚠ {_viol}")
+
+    _has_violation = bool(_line3_parts and _viol and _viol not in ['-', 'nan', 'None'])
+
+    if _line2_parts or _line3_parts:
+        # 用 ax.text + transform 分行控制顏色
+        ax_main.set_title("")
+        _y = 1.0
+        ax_main.text(0, _y + 0.115, _line1,
+                     transform=ax_main.transAxes, fontsize=12, fontweight='bold',
+                     va='bottom', ha='left', clip_on=False)
+        if _line2_parts:
+            ax_main.text(0, _y + 0.068, "  |  ".join(_line2_parts),
+                         transform=ax_main.transAxes, fontsize=10, color='#444444',
+                         va='bottom', ha='left', clip_on=False)
+        if _line3_parts:
+            ax_main.text(0, _y + 0.022, "  |  ".join(_line3_parts),
+                         transform=ax_main.transAxes, fontsize=10,
+                         color='#c0392b' if _has_violation else '#444444',
+                         va='bottom', ha='left', clip_on=False)
+        fig.subplots_adjust(top=0.77)
+    else:
+        ax_main.set_title(_line1, pad=18, fontsize=12)
     
     _tc = _detect_tool_col(raw_df) if raw_df is not None else None
     ax_box.set_title(f"Box Plot (by {_tc})" if _tc else "Box Plot", fontsize=10)
