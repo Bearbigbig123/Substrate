@@ -1140,18 +1140,25 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
         # 第一階段：蒐集可產圖的任務參數
         task_args = []
         task_meta = {}  # (gname, cname) -> safe_g, safe_c
+        filtered_data = basic_result.get("filtered_data", {})
 
         for _, chart_row in all_charts_info.iterrows():
             gname = str(chart_row.get('GroupName', ''))
             cname = str(chart_row.get('ChartName', ''))
             try:
-                csv_path = _find_file(raw_data_directory, gname, cname)
-                if not csv_path or not os.path.isfile(csv_path):
-                    continue
-                df_chart = pd.read_csv(csv_path)
-                for col in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']:
-                    if col in df_chart.columns and 'matching_group' not in df_chart.columns:
-                        df_chart = df_chart.rename(columns={col: 'matching_group'})
+                # 優先使用三段式過濾後的資料（與統計計算一致，不含 Dormant group）
+                df_filtered = filtered_data.get((gname, cname))
+                if df_filtered is not None and not df_filtered.empty:
+                    df_chart = df_filtered
+                else:
+                    # 回退：讀原始 CSV（Insufficient Data 等無過濾資料的情況）
+                    csv_path = _find_file(raw_data_directory, gname, cname)
+                    if not csv_path or not os.path.isfile(csv_path):
+                        continue
+                    df_chart = pd.read_csv(csv_path)
+                    for col in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']:
+                        if col in df_chart.columns and 'matching_group' not in df_chart.columns:
+                            df_chart = df_chart.rename(columns={col: 'matching_group'})
                 if 'matching_group' not in df_chart.columns:
                     continue
                 safe_g = "".join(c if c.isalnum() or c in "-_" else "_" for c in gname)

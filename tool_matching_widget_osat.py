@@ -277,7 +277,7 @@ class ToolMatchingWidget(QtWidgets.QWidget):
         # 新增資料篩選模式選擇
         filter_layout = QtWidgets.QHBoxLayout()
         self.filter_mode_combo = QtWidgets.QComboBox()
-        self.filter_mode_combo.addItems(["All Data", "Specified Date (1M mean/6M sigma)", "Latest Data (1M mean/6M sigma)"])
+        self.filter_mode_combo.addItems(["All Data", "Specified Date (1M / Dormant)", "Latest Data (1M / Dormant)"])
         self.filter_mode_combo.setFixedWidth(260)
         self.filter_mode_combo.setFont(QtGui.QFont("Microsoft JhengHei", 11))
         filter_layout.addWidget(QtWidgets.QLabel("Data Filter Mode:"))
@@ -392,10 +392,10 @@ class ToolMatchingWidget(QtWidgets.QWidget):
   <div style="margin-top:12px; font-size:13px; color:#344CB7;">
     <strong>【Filter Mode Calculation Description】</strong><br>
     <ul style="margin:8px 0 8px 20px; padding-left:0;">
-      <li>Mean/Std/Sample Size: For each matching_group, take data "one month before the specified date". If insufficient, fill to the specified number (default 5, adjustable in UI), then calculate mean/std/count.</li>
-      <li>Median(sigma): For each matching_group, take data "six months before the specified date". If insufficient, fill to the specified number (default 5), calculate std for each group, then take median.</li>
-      <li>Chart Display: Based on "one month data (filled to specified number)".</li>
-      <li>If the same group has multiple data at the same time, all are included in the calculation.</li>
+      <li><b>Dormant</b>: If a group has 0 data points in the last 7 days, it is excluded entirely from analysis.</li>
+      <li><b>Force Fill</b>: If a group has &ge;1 point in the last 7 days but &lt;5 in the last 30 days, fetch the latest 5 historical records regardless of time limit.</li>
+      <li><b>Normal</b>: If a group has &ge;1 point in the last 7 days and &ge;5 in the last 30 days, use all data within 30 days as-is.</li>
+      <li>Both mean and sigma windows use the same 30-day dataset.</li>
     </ul>
     <span style="color:#8a6d3b;">(All data mode directly uses all data for group calculation, no filling)</span>
   </div>
@@ -656,8 +656,8 @@ class ToolMatchingWidget(QtWidgets.QWidget):
             print("\n[DEBUG] All unique (GroupName, ChartName) pairs:")
             for pair in grouped.groups.keys():
                 print("  ", pair)
-            sigma_df_all = []  # 收集所有半年資料
-            mean_df_all = []   # 收集所有一個月(補到5筆)資料
+            sigma_df_all = []  # 收集所有 30 天資料
+            mean_df_all = []   # 收集所有 30 天資料（三段式邏輯處理後）
             for (gname, cname), subdf in grouped:
                 print(f"[DEBUG] Now processing group: GroupName='{gname}', ChartName='{cname}' | subdf.shape={subdf.shape}")
                 characteristic = subdf["characteristic"].dropna().unique()
@@ -665,34 +665,36 @@ class ToolMatchingWidget(QtWidgets.QWidget):
                     self.status_label.setText(f"Group: {gname}-{cname} characteristic is not unique or missing")
                     continue
                 mean_end = pd.Timestamp(base_date)
-                sigma_end = pd.Timestamp(base_date)
-                mean_start = mean_end - pd.DateOffset(months=1)
-                sigma_start = sigma_end - pd.DateOffset(months=6)
-                # 先抓初始區間
+                mean_start = mean_end - pd.DateOffset(days=30)
+                week_start = mean_end - pd.Timedelta(days=7)
+                MIN_FILL = 5
+                # 先抓 30 天初始區間（mean 與 sigma 共用同一資料集）
                 mean_df = subdf[(subdf["point_time"] > mean_start) & (subdf["point_time"] <= mean_end)].copy()
-                sigma_df = subdf[(subdf["point_time"] > sigma_start) & (subdf["point_time"] <= sigma_end)].copy()
-                # 針對每個 matching_group 補足 mean_df（只在不足時才補）
-                min_time = subdf["point_time"].min()
+                sigma_df = mean_df.copy()
+                # 三段式補點邏輯：依當週活躍度決定處理方式
                 for mg in subdf["matching_group"].unique():
-                    mg_mean = mean_df[mean_df["matching_group"] == mg]
-                    if len(mg_mean) < fill_num:
-                        all_mg = subdf[subdf["matching_group"] == mg].sort_values("point_time")
-                        cur_start = mean_start
-                        while len(mg_mean) < fill_num and cur_start > min_time:
-                            cur_start = cur_start - pd.Timedelta(days=7)
-                            mg_mean = all_mg[(all_mg["point_time"] > cur_start) & (all_mg["point_time"] <= mean_end)]
-                        # 合併補足
-                        mean_df = pd.concat([mean_df, mg_mean]).drop_duplicates()
-                # sigma_df同理（只在不足時才補）
-                for mg in subdf["matching_group"].unique():
-                    mg_sigma = sigma_df[sigma_df["matching_group"] == mg]
-                    if len(mg_sigma) < fill_num:
-                        all_mg = subdf[subdf["matching_group"] == mg].sort_values("point_time")
-                        cur_start = sigma_start
-                        while len(mg_sigma) < fill_num and cur_start > min_time:
-                            cur_start = cur_start - pd.Timedelta(days=14)
-                            mg_sigma = all_mg[(all_mg["point_time"] > cur_start) & (all_mg["point_time"] <= sigma_end)]
-                        sigma_df = pd.concat([sigma_df, mg_sigma]).drop_duplicates()
+                    mg_week = subdf[
+                        (subdf["matching_group"] == mg) &
+                        (subdf["point_time"] > week_start) &
+                        (subdf["point_time"] <= mean_end)
+                    ]
+                    if len(mg_week) == 0:
+                        # Dormant：當週無資料，完全排除此 group
+                        mean_df = mean_df[mean_df["matching_group"] != mg]
+                        sigma_df = sigma_df[sigma_df["matching_group"] != mg]
+                        print(f"[INFO] {gname}-{cname}: group '{mg}' Dormant (no data in last 7 days), excluded.")
+                        continue
+                    mg_30d = mean_df[mean_df["matching_group"] == mg]
+                    if len(mg_30d) < MIN_FILL:
+                        # 強制補足：取歷史最新 MIN_FILL 筆（不限時間）
+                        mg_fill = (
+                            subdf[subdf["matching_group"] == mg]
+                            .sort_values("point_time", ascending=False)
+                            .head(MIN_FILL)
+                        )
+                        mean_df = pd.concat([mean_df[mean_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                        sigma_df = pd.concat([sigma_df[sigma_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                    # else: 正常使用 30 天內所有資料（不做任何補點）
                 mean_df_all.append(mean_df.assign(GroupName=gname, ChartName=cname))
                 sigma_df_all.append(sigma_df.assign(GroupName=gname, ChartName=cname))
                 mean_stats = mean_df.groupby("matching_group")["point_val"].agg(['mean', 'count']).reset_index()
@@ -734,30 +736,36 @@ class ToolMatchingWidget(QtWidgets.QWidget):
                     continue
                 latest_time = subdf["point_time"].max()
                 mean_end = latest_time
-                sigma_end = latest_time
-                mean_start = mean_end - pd.DateOffset(months=1)
-                sigma_start = sigma_end - pd.DateOffset(months=6)
+                mean_start = mean_end - pd.DateOffset(days=30)
+                week_start = mean_end - pd.Timedelta(days=7)
+                MIN_FILL = 5
+                # 先抓 30 天初始區間（mean 與 sigma 共用同一資料集）
                 mean_df = subdf[(subdf["point_time"] > mean_start) & (subdf["point_time"] <= mean_end)].copy()
-                sigma_df = subdf[(subdf["point_time"] > sigma_start) & (subdf["point_time"] <= sigma_end)].copy()
-                min_time = subdf["point_time"].min()
+                sigma_df = mean_df.copy()
+                # 三段式補點邏輯：依當週活躍度決定處理方式
                 for mg in subdf["matching_group"].unique():
-                    mg_mean = mean_df[mean_df["matching_group"] == mg]
-                    if len(mg_mean) < fill_num:
-                        all_mg = subdf[subdf["matching_group"] == mg].sort_values("point_time")
-                        cur_start = mean_start
-                        while len(mg_mean) < fill_num and cur_start > min_time:
-                            cur_start = cur_start - pd.Timedelta(days=7)
-                            mg_mean = all_mg[(all_mg["point_time"] > cur_start) & (all_mg["point_time"] <= mean_end)]
-                        mean_df = pd.concat([mean_df, mg_mean]).drop_duplicates()
-                for mg in subdf["matching_group"].unique():
-                    mg_sigma = sigma_df[sigma_df["matching_group"] == mg]
-                    if len(mg_sigma) < fill_num:
-                        all_mg = subdf[subdf["matching_group"] == mg].sort_values("point_time")
-                        cur_start = sigma_start
-                        while len(mg_sigma) < fill_num and cur_start > min_time:
-                            cur_start = cur_start - pd.Timedelta(days=14)
-                            mg_sigma = all_mg[(all_mg["point_time"] > cur_start) & (all_mg["point_time"] <= sigma_end)]
-                        sigma_df = pd.concat([sigma_df, mg_sigma]).drop_duplicates()
+                    mg_week = subdf[
+                        (subdf["matching_group"] == mg) &
+                        (subdf["point_time"] > week_start) &
+                        (subdf["point_time"] <= mean_end)
+                    ]
+                    if len(mg_week) == 0:
+                        # Dormant：當週無資料，完全排除此 group
+                        mean_df = mean_df[mean_df["matching_group"] != mg]
+                        sigma_df = sigma_df[sigma_df["matching_group"] != mg]
+                        print(f"[INFO] {gname}-{cname}: group '{mg}' Dormant (no data in last 7 days), excluded.")
+                        continue
+                    mg_30d = mean_df[mean_df["matching_group"] == mg]
+                    if len(mg_30d) < MIN_FILL:
+                        # 強制補足：取歷史最新 MIN_FILL 筆（不限時間）
+                        mg_fill = (
+                            subdf[subdf["matching_group"] == mg]
+                            .sort_values("point_time", ascending=False)
+                            .head(MIN_FILL)
+                        )
+                        mean_df = pd.concat([mean_df[mean_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                        sigma_df = pd.concat([sigma_df[sigma_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                    # else: 正常使用 30 天內所有資料（不做任何補點）
                 mean_df_all.append(mean_df.assign(GroupName=gname, ChartName=cname))
                 sigma_df_all.append(sigma_df.assign(GroupName=gname, ChartName=cname))
                 mean_stats = mean_df.groupby("matching_group")["point_val"].agg(['mean', 'count']).reset_index()
@@ -792,9 +800,9 @@ class ToolMatchingWidget(QtWidgets.QWidget):
 
     def _analyze_multiple_groups_time(self, mean_df, sigma_df, group_stats, gname, cname, characteristic, results):
         """
-        多組分析（mean/std/count 來自一個月 window，median(sigma) 來自半年 window）
-        - mean, std, count: 來自 mean_df（一個月 window，補到5筆）
-        - median_sigma: 來自 sigma_df（半年 window，補到5筆）
+        多組分析（mean/std/count 與 median(sigma) 共用同一 30 天 window，三段式補點邏輯處理後）
+        - mean, std, count: 來自 mean_df（30 天 window，三段式補點）
+        - median_sigma: 來自 sigma_df（同 mean_df，三段式補點）
         """
         # 只納入樣本數 >= 5 的 group 計算 median
         valid_mean_df = mean_df.groupby("matching_group").filter(lambda x: len(x) >= 5)
@@ -1907,34 +1915,32 @@ def _legacy_analyze_tool_matching_data_v1(df, config):
             characteristic = characteristic[0]
             
             mean_end = base_date
-            sigma_end = base_date
-            mean_start = mean_end - pd.DateOffset(months=1)
-            sigma_start = sigma_end - pd.DateOffset(months=6)
-            
-            # 抓取初始區間
+            mean_start = mean_end - pd.DateOffset(days=30)
+            week_start = mean_end - pd.Timedelta(days=7)
+            MIN_FILL = 5
+            # 先抓 30 天初始區間（mean 與 sigma 共用同一資料集）
             mean_df = subdf[(subdf["point_time"] > mean_start) & (subdf["point_time"] <= mean_end)].copy()
-            sigma_df = subdf[(subdf["point_time"] > sigma_start) & (subdf["point_time"] <= sigma_end)].copy()
-            
-            # 補足數據
-            min_time = subdf["point_time"].min()
+            sigma_df = mean_df.copy()
+            # 三段式補點邏輯
             for mg in subdf["matching_group"].unique():
-                mg_mean_data = mean_df[mean_df["matching_group"] == mg]
-                if len(mg_mean_data) < fill_num:
-                    additional_needed = fill_num - len(mg_mean_data)
-                    additional_data = subdf[
-                        (subdf["matching_group"] == mg) & 
-                        (subdf["point_time"] <= mean_start)
-                    ].nlargest(additional_needed, "point_time")
-                    mean_df = pd.concat([mean_df, additional_data], ignore_index=True)
-                
-                mg_sigma_data = sigma_df[sigma_df["matching_group"] == mg]
-                if len(mg_sigma_data) < fill_num:
-                    additional_needed = fill_num - len(mg_sigma_data)
-                    additional_data = subdf[
-                        (subdf["matching_group"] == mg) & 
-                        (subdf["point_time"] <= sigma_start)
-                    ].nlargest(additional_needed, "point_time")
-                    sigma_df = pd.concat([sigma_df, additional_data], ignore_index=True)
+                mg_week = subdf[
+                    (subdf["matching_group"] == mg) &
+                    (subdf["point_time"] > week_start) &
+                    (subdf["point_time"] <= mean_end)
+                ]
+                if len(mg_week) == 0:
+                    mean_df = mean_df[mean_df["matching_group"] != mg]
+                    sigma_df = sigma_df[sigma_df["matching_group"] != mg]
+                    continue
+                mg_30d = mean_df[mean_df["matching_group"] == mg]
+                if len(mg_30d) < MIN_FILL:
+                    mg_fill = (
+                        subdf[subdf["matching_group"] == mg]
+                        .sort_values("point_time", ascending=False)
+                        .head(MIN_FILL)
+                    )
+                    mean_df = pd.concat([mean_df[mean_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                    sigma_df = pd.concat([sigma_df[sigma_df["matching_group"] != mg], mg_fill]).drop_duplicates()
             
             mean_stats = mean_df.groupby("matching_group")["point_val"].agg(['mean', 'count']).reset_index()
             sigma_stats = sigma_df.groupby("matching_group")["point_val"].agg(['std']).reset_index()
@@ -1964,32 +1970,32 @@ def _legacy_analyze_tool_matching_data_v1(df, config):
             
             latest_time = subdf["point_time"].max()
             mean_end = latest_time
-            sigma_end = latest_time
-            mean_start = mean_end - pd.DateOffset(months=1)
-            sigma_start = sigma_end - pd.DateOffset(months=6)
-            
+            mean_start = mean_end - pd.DateOffset(days=30)
+            week_start = mean_end - pd.Timedelta(days=7)
+            MIN_FILL = 5
+            # 先抓 30 天初始區間（mean 與 sigma 共用同一資料集）
             mean_df = subdf[(subdf["point_time"] > mean_start) & (subdf["point_time"] <= mean_end)].copy()
-            sigma_df = subdf[(subdf["point_time"] > sigma_start) & (subdf["point_time"] <= sigma_end)].copy()
-            
-            min_time = subdf["point_time"].min()
+            sigma_df = mean_df.copy()
+            # 三段式補點邏輯
             for mg in subdf["matching_group"].unique():
-                mg_mean_data = mean_df[mean_df["matching_group"] == mg]
-                if len(mg_mean_data) < fill_num:
-                    additional_needed = fill_num - len(mg_mean_data)
-                    additional_data = subdf[
-                        (subdf["matching_group"] == mg) & 
-                        (subdf["point_time"] <= mean_start)
-                    ].nlargest(additional_needed, "point_time")
-                    mean_df = pd.concat([mean_df, additional_data], ignore_index=True)
-                
-                mg_sigma_data = sigma_df[sigma_df["matching_group"] == mg]
-                if len(mg_sigma_data) < fill_num:
-                    additional_needed = fill_num - len(mg_sigma_data)
-                    additional_data = subdf[
-                        (subdf["matching_group"] == mg) & 
-                        (subdf["point_time"] <= sigma_start)
-                    ].nlargest(additional_needed, "point_time")
-                    sigma_df = pd.concat([sigma_df, additional_data], ignore_index=True)
+                mg_week = subdf[
+                    (subdf["matching_group"] == mg) &
+                    (subdf["point_time"] > week_start) &
+                    (subdf["point_time"] <= mean_end)
+                ]
+                if len(mg_week) == 0:
+                    mean_df = mean_df[mean_df["matching_group"] != mg]
+                    sigma_df = sigma_df[sigma_df["matching_group"] != mg]
+                    continue
+                mg_30d = mean_df[mean_df["matching_group"] == mg]
+                if len(mg_30d) < MIN_FILL:
+                    mg_fill = (
+                        subdf[subdf["matching_group"] == mg]
+                        .sort_values("point_time", ascending=False)
+                        .head(MIN_FILL)
+                    )
+                    mean_df = pd.concat([mean_df[mean_df["matching_group"] != mg], mg_fill]).drop_duplicates()
+                    sigma_df = pd.concat([sigma_df[sigma_df["matching_group"] != mg], mg_fill]).drop_duplicates()
             
             mean_stats = mean_df.groupby("matching_group")["point_val"].agg(['mean', 'count']).reset_index()
             sigma_stats = sigma_df.groupby("matching_group")["point_val"].agg(['std']).reset_index()
@@ -2267,8 +2273,8 @@ def _analyze_multiple_groups_headless(subdf, group_stats, gname, cname, characte
 def _analyze_multiple_groups_time_headless(mean_df, sigma_df, group_stats, gname, cname, characteristic, results, config):
     """
     無 UI 版本的多組分析（時間模式）
-    - mean, std, count: 來自 mean_df（一個月 window，補到5筆）
-    - median_sigma: 來自 sigma_df（半年 window，補到5筆）
+    - mean, std, count: 來自 mean_df（30 天 window，三段式補點）
+    - median_sigma: 來自 sigma_df（同 mean_df，30 天 window，三段式補點）
     """
     # 只納入樣本數 >= 5 的 group 計算 median
     valid_mean_df = mean_df.groupby("matching_group").filter(lambda x: len(x) >= 5)
@@ -2732,7 +2738,7 @@ def _get_abnormal_type_headless(mean_status, sigma_index, k_value, config):
 def analyze_tool_matching_data(all_charts_info: "pd.DataFrame", raw_data_directory: str, config: dict) -> dict:
     """
     批次任務模式：遍歷 all_charts_info 中每個 (GroupName, ChartName)，
-    在 raw_data_directory 找對應 CSV，執行 1M Mean / 6M Sigma 雙視窗分析。
+    在 raw_data_directory 找對應 CSV，執行 30 天 window 三段式補點分析（Dormant/Force Fill/Normal）。
 
     Args:
         all_charts_info: DataFrame with [GroupName, ChartName, Characteristics]
@@ -2758,6 +2764,7 @@ def analyze_tool_matching_data(all_charts_info: "pd.DataFrame", raw_data_directo
     base_date = pd.Timestamp(base_date_raw) if base_date_raw else pd.Timestamp.now().normalize()
 
     results = []
+    filtered_data = {}  # (gname, cname) -> mean_df（三段式過濾後，供圖表使用）
 
     for _, chart_row in all_charts_info.iterrows():
         gname = str(chart_row.get('GroupName', '')).strip()
@@ -2825,37 +2832,51 @@ def analyze_tool_matching_data(all_charts_info: "pd.DataFrame", raw_data_directo
                 ])
             continue
 
-        # 雙視窗切片（1M Mean / 6M Sigma）
+        # 三段式補點（1M window）
         mean_end = base_date
         mean_start = mean_end - pd.DateOffset(days=30)
-        sigma_end = base_date
-        data_before_base = subdf[subdf['point_time'] <= sigma_end]
-        sigma_df_6m = data_before_base[
-            data_before_base['point_time'] > (sigma_end - pd.DateOffset(days=180))
-        ].copy()
-        # 直接使用 6M 視窗；若資料不足，下方「補足 fill_num 筆」邏輯會自動回填
-        sigma_df = sigma_df_6m
+        week_start = mean_end - pd.Timedelta(days=7)
+        MIN_FILL = 5
+        # 先抓 30 天初始區間（mean 與 sigma 共用同一資料集）
         mean_df = subdf[(subdf['point_time'] > mean_start) & (subdf['point_time'] <= mean_end)].copy()
-
-        # 補足每台機台的 mean_df（不足 5 筆則忽略時間限制，往回抓最近 5 筆）
+        sigma_df = mean_df.copy()
         for mg in all_groups:
-            if len(mean_df[mean_df['matching_group'] == mg]) < 5:
+            mg_week = subdf[
+                (subdf['matching_group'] == mg) &
+                (subdf['point_time'] > week_start) &
+                (subdf['point_time'] <= mean_end)
+            ]
+            if len(mg_week) == 0:
+                # Dormant：當週無資料，完全排除此 group
+                mean_df = mean_df[mean_df['matching_group'] != mg]
+                sigma_df = sigma_df[sigma_df['matching_group'] != mg]
+                continue
+            mg_30d = mean_df[mean_df['matching_group'] == mg]
+            if len(mg_30d) < MIN_FILL:
+                # 強制補足：取歷史最新 MIN_FILL 筆
                 mg_fill = (
                     subdf[subdf['matching_group'] == mg]
                     .sort_values('point_time', ascending=False)
-                    .head(5)
+                    .head(MIN_FILL)
                 )
-                mean_df = pd.concat([mean_df, mg_fill]).drop_duplicates()
+                mean_df = pd.concat([mean_df[mean_df['matching_group'] != mg], mg_fill]).drop_duplicates()
+                sigma_df = pd.concat([sigma_df[sigma_df['matching_group'] != mg], mg_fill]).drop_duplicates()
+            # else: 正常使用 30 天內所有資料
 
-        # 補足每台機台的 sigma_df
-        for mg in all_groups:
-            if len(sigma_df[sigma_df['matching_group'] == mg]) < fill_num:
-                mg_fill = (
-                    subdf[subdf['matching_group'] == mg]
-                    .sort_values('point_time', ascending=False)
-                    .head(fill_num)
-                )
-                sigma_df = pd.concat([sigma_df, mg_fill]).drop_duplicates()
+        # 全 Dormant 偵測：若所有 group 近 7 天都無資料，mean_df 為空
+        if mean_df.empty:
+            group_all_str = '/'.join(str(g) for g in all_groups)
+            for mg in all_groups:
+                results.append([
+                    gname, cname, str(mg), group_all_str,
+                    'Insufficient Data', 'Insufficient Data', 'No Compare',
+                    0.0, 0.0, '-', '-', 0, characteristic
+                ])
+            print(f"[INFO] {gname}-{cname}: all groups have no data in last 7 days, skipped.")
+            continue
+
+        # 儲存三段式過濾後的資料（供圖表使用，資料範圍與統計計算一致）
+        filtered_data[(gname, cname)] = mean_df.copy()
 
         # 計算統計量
         mean_stats = mean_df.groupby('matching_group')['point_val'].agg(['mean', 'count']).reset_index()
@@ -2907,6 +2928,7 @@ def analyze_tool_matching_data(all_charts_info: "pd.DataFrame", raw_data_directo
     return {
         "summary": {"total_groups": len(result_df), "abnormal_groups": abnormal_count},
         "results": result_df,
+        "filtered_data": filtered_data,
     }
 
 
