@@ -1,5 +1,14 @@
 # OSAT SPC System
 
+## Repository Notes
+
+This repo now includes:
+
+- `input/column_aliases.json`: friendly rawdata column-name mapping config
+- `input/unified_rawdata_sample.csv`: sample Unified_Vertical rawdata
+- `generate_unified_test_data.py`: script for generating Unified_Vertical sample rawdata
+- `input/group_weekly_summary_history_template.csv`: group weekly summary CSV template
+
 統計製程管制 (SPC) 分析系統，提供網頁介面與 API 服務，支援 OOB 分析、Tool Matching 分析、和 SPC CPK Dashboard。
 
 ## 系統架構

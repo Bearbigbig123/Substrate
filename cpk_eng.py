@@ -3,6 +3,7 @@ cpk_eng.py — SPC CPK Dashboard 計算與繪圖模組
 包含 CPK 計算、時間窗口分析、SPC 圖表產生及 Excel 匯出等純函式。
 """
 import os
+import re
 import math
 import base64
 import tempfile
@@ -220,7 +221,7 @@ def _detect_tool_col(df: pd.DataFrame) -> Optional[str]:
     """偵測 DataFrame 中代表機台/工具的欄位（支援 EQP_id、ByTool 等多種命名）。
     回傳第一個有效欄位名稱，無則回傳 None。"""
     # 👇 這裡加入了 'Matching' 與 'matching_group'
-    for col in ['EQP_id', 'ByTool', 'Tool', 'tool_id', 'TOOL_ID', 'Matching', 'matching_group']:
+    for col in ['EQP_id', 'ByTool', 'Tool', 'tool_id', 'TOOL_ID', 'Matching', 'matching_group', 'site_id']:
         if col in df.columns:
             valid = df[col].dropna().astype(str).str.strip()
             valid = valid[valid != '']
@@ -230,99 +231,146 @@ def _detect_tool_col(df: pd.DataFrame) -> Optional[str]:
 
 
 def _draw_main_spc_chart_api(ax, plot_df, chart_info, start_date, end_date, custom_mode):
-    y = plot_df['point_val'].values
-    x = range(1, len(y) + 1)
-    
+    # 偵測 site/tool 欄位（Unified 格式用 site_id，其他格式用 EQP_id 等）
+    site_col = _detect_tool_col(plot_df)
+
     if 'point_time' in plot_df.columns:
         try:
+            plot_df = plot_df.copy()
+            plot_df['point_time'] = pd.to_datetime(plot_df['point_time'])
             plot_df = plot_df.sort_values('point_time').reset_index(drop=True)
-            y = plot_df['point_val'].values
-            
-            if not plot_df.empty:
-                times = pd.to_datetime(plot_df['point_time']).to_numpy()
-                tmin, tmax = times.min(), times.max()
-                
-                if custom_mode and start_date and end_date:
-                    start_time = pd.to_datetime(start_date)
-                    end_time = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-                    windows = [(start_time, end_time, 'Custom', '#dbeafe')]
-                else:
-                    # 用當天最後一毫秒，確保當天所有時間點都被底色涵蓋（原本用 00:00:00 會漏掉同天的下午資料點）
-                    end_sel = (pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)) if end_date else pd.Timestamp(tmax)
-                    if end_sel > pd.Timestamp(tmax): end_sel = pd.Timestamp(tmax)
-                    start1 = end_sel - pd.DateOffset(months=1)
-                    start2 = end_sel - pd.DateOffset(months=2)
-                    start3 = end_sel - pd.DateOffset(months=3)
-                    windows = [
-                        (start1, end_sel, 'L0', '#dbeafe'),
-                        (start2, start1, 'L1', '#fef9c3'),
-                        (start3, start2, 'L2', '#ede9fe'),
-                    ]
-                
-                text_trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
-                n = len(times)
-                def t2ix_left(t): return float(np.searchsorted(times, np.datetime64(t), side='left')) + 0.5
-                def t2ix_right(t): return float(np.searchsorted(times, np.datetime64(t), side='right')) + 0.5
-                
-                x_min, x_max = 0.5, n + 0.5
-                for s, e, lab, col in windows:
-                    s_clip = max(pd.Timestamp(s), pd.Timestamp(tmin))
-                    e_clip = min(pd.Timestamp(e), pd.Timestamp(tmax))
-                    if e_clip <= s_clip: continue
-                    xl = max(x_min, t2ix_left(s_clip))
-                    xr = min(x_max, t2ix_right(e_clip))
-                    if xr <= xl: continue
-                    ax.axvspan(xl, xr, color=col, alpha=0.25, zorder=0)
-                    ax.text((xl + xr) / 2.0, 1.04, lab, transform=text_trans, ha='center', va='top', fontsize=8, color='#374151', alpha=0.9)
-        except Exception: pass
-    
-    ax.plot(x, y, linestyle='-', marker='o', color='#2563eb', markersize=4, linewidth=1.0)
-    
+        except Exception:
+            pass
+
+    y = plot_df['point_val'].values
+
+    # ── x 軸對映：site 模式以 unique point_time 為序號（同一時間多 site 共用同一 x）
+    if site_col is not None and 'point_time' in plot_df.columns and not plot_df.empty:
+        times_uniq = sorted(plot_df['point_time'].unique())
+        t2x = {t: i + 1 for i, t in enumerate(times_uniq)}
+        plot_df = plot_df.copy()
+        plot_df['_xpos'] = plot_df['point_time'].map(t2x)
+        n_x = len(times_uniq)
+        times_arr = np.array([pd.Timestamp(t).to_datetime64() for t in times_uniq])
+    else:
+        times_uniq = None
+        plot_df = plot_df.copy()
+        plot_df['_xpos'] = np.arange(1, len(y) + 1)
+        n_x = len(y)
+        times_arr = pd.to_datetime(plot_df['point_time']).to_numpy() if 'point_time' in plot_df.columns and not plot_df.empty else None
+
+    # ── 時間窗口背景色塊 (L0/L1/L2/Custom) ────────────────────
+    if times_arr is not None and len(times_arr) > 0:
+        try:
+            tmin = pd.Timestamp(times_arr.min())
+            tmax = pd.Timestamp(times_arr.max())
+            if custom_mode and start_date and end_date:
+                windows = [(pd.to_datetime(start_date),
+                            pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1),
+                            'Custom', '#dbeafe')]
+            else:
+                end_sel = (pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)) if end_date else tmax
+                if end_sel > tmax: end_sel = tmax
+                start1 = end_sel - pd.DateOffset(months=1)
+                start2 = end_sel - pd.DateOffset(months=2)
+                start3 = end_sel - pd.DateOffset(months=3)
+                windows = [
+                    (start1, end_sel, 'L0', '#dbeafe'),
+                    (start2, start1, 'L1', '#fef9c3'),
+                    (start3, start2, 'L2', '#ede9fe'),
+                ]
+            text_trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+            x_min, x_max = 0.5, n_x + 0.5
+            def t2ix_left(t):  return float(np.searchsorted(times_arr, np.datetime64(pd.Timestamp(t)), side='left'))  + 0.5
+            def t2ix_right(t): return float(np.searchsorted(times_arr, np.datetime64(pd.Timestamp(t)), side='right')) + 0.5
+            for s, e, lab, col in windows:
+                s_clip = max(pd.Timestamp(s), tmin)
+                e_clip = min(pd.Timestamp(e), tmax)
+                if e_clip <= s_clip: continue
+                xl = max(x_min, t2ix_left(s_clip))
+                xr = min(x_max, t2ix_right(e_clip))
+                if xr <= xl: continue
+                ax.axvspan(xl, xr, color=col, alpha=0.25, zorder=0)
+                ax.text((xl + xr) / 2.0, 1.04, lab, transform=text_trans,
+                        ha='center', va='top', fontsize=8, color='#374151', alpha=0.9)
+        except Exception:
+            pass
+
+    # ── 主折線圖：有 site_col 時每個 site 不同色、相同 site 跨時間點連線 ──
+    def _nat_key(s):
+        return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(s))]
+
+    if site_col is not None:
+        site_groups = sorted(plot_df[site_col].dropna().astype(str).unique(), key=_nat_key)
+        _palette = plt.cm.tab20(np.linspace(0, 1, max(len(site_groups), 1)))
+        for i, site in enumerate(site_groups):
+            sdf = plot_df[plot_df[site_col].astype(str) == site].sort_values('_xpos')
+            ax.plot(sdf['_xpos'], sdf['point_val'],
+                    linestyle='-', marker='o', color=_palette[i],
+                    markersize=3, linewidth=0.9, label=site, alpha=0.85, zorder=2)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=6,
+                  ncol=1 if len(site_groups) <= 17 else 2,
+                  framealpha=0.7, title='Site', title_fontsize=7)
+    else:
+        ax.plot(plot_df['_xpos'].values, y,
+                linestyle='-', marker='o', color='#2563eb', markersize=4, linewidth=1.0)
+
+    # ── OOC 標記 (USL/LSL 超界點紅色) ───────────────────────
     usl = chart_info.get('USL', None)
     lsl = chart_info.get('LSL', None)
     target = _get_target_value(chart_info)
     mean_val = float(np.mean(y)) if len(y) else None
-    
+
     if usl is not None:
-        ax.scatter([xi for xi, yi in zip(x, y) if yi > usl], [yi for yi in y if yi > usl], color='#dc2626', s=25, zorder=5)
+        ooc = plot_df['point_val'] > usl
+        if ooc.any():
+            ax.scatter(plot_df.loc[ooc, '_xpos'], plot_df.loc[ooc, 'point_val'],
+                       color='#dc2626', s=25, zorder=5)
     if lsl is not None:
-        ax.scatter([xi for xi, yi in zip(x, y) if yi < lsl], [yi for yi in y if yi < lsl], color='#dc2626', marker='s', s=25, zorder=5)
-    
-    extra_vals = [v for v in [usl, lsl, target, mean_val] if v is not None and not (isinstance(v, float) and np.isnan(v))]
-    if len(y) > 0:
-        ymin_sel, ymax_sel = float(np.min(y)), float(np.max(y))
-    else:
-        ymin_sel, ymax_sel = (0.0, 1.0)
+        ooc = plot_df['point_val'] < lsl
+        if ooc.any():
+            ax.scatter(plot_df.loc[ooc, '_xpos'], plot_df.loc[ooc, 'point_val'],
+                       color='#dc2626', marker='s', s=25, zorder=5)
+
+    # ── y 軸範圍 ──────────────────────────────────────────
+    extra_vals = [v for v in [usl, lsl, target, mean_val]
+                  if v is not None and not (isinstance(v, float) and np.isnan(v))]
+    ymin_sel, ymax_sel = (float(np.min(y)), float(np.max(y))) if len(y) else (0.0, 1.0)
     if extra_vals:
-        ymin_sel, ymax_sel = min(ymin_sel, min(extra_vals)), max(ymax_sel, max(extra_vals))
+        ymin_sel = min(ymin_sel, min(extra_vals))
+        ymax_sel = max(ymax_sel, max(extra_vals))
     rng = ymax_sel - ymin_sel
     margin = 0.05 * rng if rng > 0 else 1.0
     ax.set_ylim(ymin_sel - margin, ymax_sel + margin)
-    
+
+    # ── 規格線 (USL/LSL/Target/Mean) ──────────────────────────
     trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
     def segment_with_label(val, name, color, va='center'):
         if val is None or (isinstance(val, float) and np.isnan(val)): return
         ax.plot([0.0, 0.96], [val, val], transform=trans, color=color, linestyle='--', linewidth=1.0)
         ax.text(0.96, val, name, transform=trans, color=color, va=va, ha='left', fontsize=8)
-    
-    segment_with_label(usl, 'USL', '#ef4444', va='center')
-    segment_with_label(lsl, 'LSL', '#ef4444', va='center')
-    segment_with_label(target, 'Target', '#f59e0b', va='center')
-    segment_with_label(mean_val, 'Mean', '#16a34a', va='center')
-    
-    if 'point_time' in plot_df.columns and not plot_df.empty:
-        times = plot_df['point_time'].tolist()
-        total = len(times)
-        if total <= 8:
-            tick_idx = list(range(1, total + 1))
-        else:
-            step = max(1, total // 6)
-            tick_idx = list(range(1, total + 1, step))
-            if tick_idx[-1] != total: tick_idx.append(total)
-        labels = [times[i-1].strftime('%Y-%m-%d') for i in tick_idx]
+    segment_with_label(usl,      'USL',    '#ef4444')
+    segment_with_label(lsl,      'LSL',    '#ef4444')
+    segment_with_label(target,   'Target', '#f59e0b')
+    segment_with_label(mean_val, 'Mean',   '#16a34a')
+
+    # ── x 軸刻度標籤 ───────────────────────────────────────
+    if times_uniq is not None and len(times_uniq) > 0:
+        total = len(times_uniq)
+        n_ticks = min(10, total)
+        tick_idx = np.linspace(1, total, n_ticks, dtype=int).tolist()
+        labels = [pd.Timestamp(times_uniq[i - 1]).strftime('%Y-%m-%d') for i in tick_idx]
         ax.set_xticks(tick_idx)
         ax.set_xticklabels(labels, rotation=90, ha='right', fontsize=8)
-    
+    elif 'point_time' in plot_df.columns and not plot_df.empty:
+        times = plot_df['point_time'].tolist()
+        total = len(times)
+        n_ticks = min(6, total)
+        tick_idx = np.linspace(1, total, n_ticks, dtype=int).tolist()
+        labels = [t.strftime('%Y-%m-%d') for t in [times[i - 1] for i in tick_idx]]
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels(labels, rotation=90, ha='right', fontsize=8)
+
     ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.5)
 
 
@@ -409,16 +457,10 @@ def _draw_qq_plot_api(ax, plot_df, chart_info):
 
 
 def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date: Optional[date] = None, end_date: Optional[date] = None, custom_mode: bool = False, metrics: Optional[dict] = None) -> str:
-    fig = plt.figure(figsize=(12, 6))
-    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1], hspace=0.3, wspace=0.25)
-    ax_main = fig.add_subplot(gs[:, 0])
-    ax_box = fig.add_subplot(gs[0, 1])
-    ax_qq = fig.add_subplot(gs[1, 1])
-    
+    fig, ax_main = plt.subplots(figsize=(12, 5))
+
     if raw_df is None or raw_df.empty:
         ax_main.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_main.transAxes)
-        ax_box.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_box.transAxes)
-        ax_qq.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_qq.transAxes)
     else:
         plot_df = raw_df.copy()
         if 'point_time' in plot_df.columns:
@@ -445,8 +487,6 @@ def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date
         
         if not plot_df.empty:
             _draw_main_spc_chart_api(ax_main, plot_df, chart_info, start_date, end_date, custom_mode)
-            _draw_box_plot_api(ax_box, plot_df, chart_info)
-            _draw_qq_plot_api(ax_qq, plot_df, chart_info)
     
     group_name = chart_info.get('GroupName', '')
     chart_name = chart_info.get('ChartName', '')
@@ -501,10 +541,6 @@ def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, start_date
         fig.subplots_adjust(top=0.77)
     else:
         ax_main.set_title(_line1, pad=18, fontsize=12)
-    
-    _tc = _detect_tool_col(raw_df) if raw_df is not None else None
-    ax_box.set_title(f"Box Plot (by {_tc})" if _tc else "Box Plot", fontsize=10)
-    ax_qq.set_title("Q-Q Plot", fontsize=10)
     
     fig.tight_layout()
     buffer = BytesIO()

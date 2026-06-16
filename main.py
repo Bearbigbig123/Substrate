@@ -216,6 +216,7 @@ class ResultItem(BaseModel):
     baseline_insufficient: Optional[bool] = False
     no_data: Optional[bool] = False
     no_data_reason: Optional[str] = None
+    cpk_below_133_cnt: Optional[int] = None
     chart_path: Optional[str] = None
     weekly_chart_path: Optional[str] = None
     by_tool_color_path: Optional[str] = None
@@ -228,6 +229,7 @@ class ResultItem(BaseModel):
 class ProcessResponse(BaseModel):
     summary: ProcessSummary
     results: List[ResultItem]
+    row_level_details: Optional[List[Dict[str, Any]]] = None
 
 # --- Tool Matching Models ---
 class ToolMatchingRequest(BaseModel):
@@ -314,7 +316,7 @@ class SPCCpkResponse(BaseModel):
 
 # --- Split Models ---
 class SplitRequest(BaseModel):
-    mode: str = Field(description="Split mode: 'Type3_Horizontal', 'Type2_Vertical', 'Vendor_Vertical', or 'Test_Horizontal'", pattern="^(Type3_Horizontal|Type2_Vertical|Vendor_Vertical|Test_Horizontal)$")
+    mode: str = Field(description="Split mode: 'Type3_Horizontal', 'Type2_Vertical', 'Vendor_Vertical', 'Test_Horizontal', or 'Unified_Vertical'", pattern="^(Type3_Horizontal|Type2_Vertical|Vendor_Vertical|Test_Horizontal|Unified_Vertical)$")
     input_files: List[str] = Field(description="List of CSV file paths to split")
     output_folder: Optional[str] = Field(default=None, description="Base output folder")
 
@@ -550,6 +552,165 @@ def _split_test_horizontal(input_path: str, final_output_folder: str) -> bool:
     except Exception as e:
         print(f"[Error] Test_Horizontal split failed for {os.path.basename(input_path)}: {e}")
         return False
+def _estimate_resolution(values) -> Optional[float]:
+    """從量測値以 GCD 法估算 Resolution（最小可分辨单位）。
+    算法：將數値依最大小數位數放大為整數後，求全部整數的 GCD，再除回原比例。
+    """
+    import math
+    clean = np.array([v for v in pd.to_numeric(pd.Series(values), errors="coerce") if pd.notna(v) and np.isfinite(v)])
+    if len(clean) < 2:
+        return None
+    sample = clean[:500]
+    max_dec = 0
+    for v in sample:
+        s = f"{v:.8f}".rstrip("0")
+        if "." in s:
+            max_dec = max(max_dec, len(s.split(".")[1]))
+    max_dec = min(max_dec, 6)
+    if max_dec == 0:
+        return 1.0
+    multiplier = 10 ** max_dec
+    int_vals = np.round(sample * multiplier).astype(np.int64)
+    g = 0
+    for v in int_vals:
+        g = math.gcd(g, int(abs(v)))
+    if g == 0:
+        return None
+    return round(g / multiplier, max_dec)
+
+
+def _split_unified_vertical(input_path: str, base_out_dir: str) -> dict:
+    """
+    Unified Vertical 格式拆分：單一 CSV 含 chart metadata + Mean/Std + Site1…SiteN。
+    回傳 {"ok": bool, "allchartinfo_path": str, "oob_dir": str, "cpk_dir": str}
+    OOB/SPC 使用 Mean 欄位當 point_val；CPK 使用 Site 欄位 melt 後各自當 point_val。
+    """
+    import re as _re
+    try:
+        df = _read_csv_with_encoding_fallback(input_path)
+
+        # 偵測 site 欄 (Site1, Site_1, site1, SITE1 等均支援)
+        site_cols = [c for c in df.columns if _re.match(r'^[Ss][Ii][Tt][Ee]_?\d+$', c)]
+        if not site_cols:
+            raise ValueError("找不到 Site 欄位（如 Site1, Site2 …）")
+
+        required_meta = ["GroupName", "ChartName", "Mean"]
+        missing = [c for c in required_meta if c not in df.columns]
+        if missing:
+            raise ValueError(f"缺少必要欄位: {', '.join(missing)}")
+
+        # ── 1. 建立 allchartinfo DataFrame ──────────────────────────
+        meta_cols = ["GroupName", "ChartName", "USL", "LSL", "UCL", "LCL", "Target"]
+        existing_meta = [c for c in meta_cols if c in df.columns]
+        charts_df = df[existing_meta].drop_duplicates(subset=["GroupName", "ChartName"]).copy()
+
+        for col in ["USL", "LSL", "UCL", "LCL", "Target"]:
+            if col not in charts_df.columns:
+                charts_df[col] = np.nan
+
+        if "Material_no" in df.columns:
+            mat = df[["GroupName", "ChartName", "Material_no"]].drop_duplicates(subset=["GroupName", "ChartName"])
+            charts_df = charts_df.merge(mat, on=["GroupName", "ChartName"], how="left")
+        else:
+            charts_df["Material_no"] = ""
+
+        if "ChartID" in df.columns:
+            cid = df[["GroupName", "ChartName", "ChartID"]].drop_duplicates(subset=["GroupName", "ChartName"])
+            charts_df = charts_df.merge(cid, on=["GroupName", "ChartName"], how="left")
+        else:
+            charts_df["ChartID"] = ""
+
+        def _infer_characteristics(row):
+            has_usl = pd.notna(row.get("USL")) and str(row.get("USL", "")).strip() != ""
+            has_lsl = pd.notna(row.get("LSL")) and str(row.get("LSL", "")).strip() != ""
+            if has_usl and has_lsl:
+                return "Nominal"
+            elif has_usl:
+                return "Smaller"
+            elif has_lsl:
+                return "Bigger"
+            return "Nominal"
+
+        charts_df["Characteristics"] = charts_df.apply(_infer_characteristics, axis=1)
+
+        # ── Resolution 估算（GCD 法，從 Site 欄位量測値估算） ───────────
+        uniq = df[["GroupName", "ChartName"]].drop_duplicates()
+        resolution_map = {}
+        for _, _r in uniq.iterrows():
+            _g, _c = _r["GroupName"], _r["ChartName"]
+            _mask = (df["GroupName"] == _g) & (df["ChartName"] == _c)
+            _site_vals = df[_mask][site_cols].values.flatten()
+            resolution_map[(_g, _c)] = _estimate_resolution(_site_vals)
+        charts_df["Resolution"] = charts_df.apply(
+            lambda r: resolution_map.get((r["GroupName"], r["ChartName"])), axis=1
+        )
+
+        allchartinfo_path = os.path.join(base_out_dir, "allchartinfo_generated.xlsx")
+        charts_df.to_excel(allchartinfo_path, sheet_name="Chart", index=False)
+
+        # ── 2. OOB per-chart CSVs (point_val = Mean) ────────────────
+        oob_dir = os.path.join(base_out_dir, "oob_charts")
+        os.makedirs(oob_dir, exist_ok=True)
+
+        id_base = ["GroupName", "ChartName"]
+        optional_id = ["point_time", "Batch_ID"]
+        oob_id_cols = id_base + [c for c in optional_id if c in df.columns]
+
+        uniq = df[["GroupName", "ChartName"]].drop_duplicates()
+        for _, row in uniq.iterrows():
+            gname, cname = row["GroupName"], row["ChartName"]
+            mask = (df["GroupName"] == gname) & (df["ChartName"] == cname)
+            sub = df[mask].copy()
+            oob_df = sub[[c for c in oob_id_cols if c in sub.columns]].copy()
+            oob_df["point_val"] = pd.to_numeric(sub["Mean"], errors="coerce")
+            oob_df = oob_df.dropna(subset=["point_val"])
+            if "point_time" in oob_df.columns:
+                try:
+                    oob_df["point_time"] = pd.to_datetime(oob_df["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+                except Exception:
+                    pass
+            if not oob_df.empty:
+                safe_g = _sanitize_filename(str(gname))
+                safe_c = _sanitize_filename(str(cname))
+                oob_df.to_csv(os.path.join(oob_dir, f"{safe_g}_{safe_c}.csv"), index=False, encoding="utf-8-sig")
+
+        # ── 3. CPK per-chart CSVs (melt site cols → point_val) ──────
+        cpk_dir = os.path.join(base_out_dir, "cpk_charts")
+        os.makedirs(cpk_dir, exist_ok=True)
+
+        cpk_id_cols = id_base + [c for c in optional_id if c in df.columns]
+
+        for _, row in uniq.iterrows():
+            gname, cname = row["GroupName"], row["ChartName"]
+            mask = (df["GroupName"] == gname) & (df["ChartName"] == cname)
+            sub = df[mask].copy()
+            avail_id = [c for c in cpk_id_cols if c in sub.columns]
+            avail_sites = [c for c in site_cols if c in sub.columns]
+            melted = sub.melt(
+                id_vars=avail_id,
+                value_vars=avail_sites,
+                var_name="site_id",
+                value_name="point_val",
+            )
+            melted["point_val"] = pd.to_numeric(melted["point_val"], errors="coerce")
+            melted = melted.dropna(subset=["point_val"])
+            if "point_time" in melted.columns:
+                try:
+                    melted["point_time"] = pd.to_datetime(melted["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+                except Exception:
+                    pass
+            if not melted.empty:
+                safe_g = _sanitize_filename(str(gname))
+                safe_c = _sanitize_filename(str(cname))
+                melted.to_csv(os.path.join(cpk_dir, f"{safe_g}_{safe_c}.csv"), index=False, encoding="utf-8-sig")
+
+        print(f"[UnifiedSplit] charts={len(uniq)}, allchartinfo={allchartinfo_path}, oob_dir={oob_dir}, cpk_dir={cpk_dir}")
+        return {"ok": True, "allchartinfo_path": allchartinfo_path, "oob_dir": oob_dir, "cpk_dir": cpk_dir}
+    except Exception as e:
+        print(f"[Error] Unified_Vertical split failed for {os.path.basename(input_path)}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def _preprocess_chart_types(all_charts_info: pd.DataFrame, raw_data_directory: str) -> Dict[str, str]:
     chart_types: Dict[str, str] = {}
     processed_files = set()
@@ -791,10 +952,19 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
         _cd_cols = ["point_time", "point_val"]
         if _site_col:
             _cd_cols.append(_site_col)
+        # 加入 Batch_ID 與 cpk（若存在）
+        for _extra in ["Batch_ID", "cpk"]:
+            if _extra in _plot_df.columns:
+                _cd_cols.append(_extra)
         _chart_data_df = _plot_df[_cd_cols].copy()
+        _weekly_mask = (
+            (_chart_data_df["point_time"] >= weekly_start_date) &
+            (_chart_data_df["point_time"] <= weekly_end_date)
+        )
         _chart_data_df["point_time"] = _chart_data_df["point_time"].astype(str)
         _chart_data_df["point_val"] = pd.to_numeric(_chart_data_df["point_val"], errors="coerce")
         _chart_data_df = _chart_data_df.dropna(subset=["point_val"])
+        _weekly_mask = _weekly_mask.loc[_chart_data_df.index]
         if _site_col:
             _chart_data_df = _chart_data_df.rename(columns={_site_col: "Matching"})
             _chart_data_df["Matching"] = _chart_data_df["Matching"].fillna("Unknown").astype(str)
@@ -804,13 +974,44 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
             _chart_data_df["is_oos"] = ~_chart_data_df["point_time"].isin(filtered_times)
         else:
             _chart_data_df["is_oos"] = False
+        # 標記 OOC 點（超過 UCL/LCL）
+        _ucl_val = chart_info.get("UCL")
+        _lcl_val = chart_info.get("LCL")
+        try:
+            _ucl_f = float(_ucl_val) if _ucl_val not in [None, "", "N/A", "nan"] else None
+            _lcl_f = float(_lcl_val) if _lcl_val not in [None, "", "N/A", "nan"] else None
+        except (TypeError, ValueError):
+            _ucl_f = None
+            _lcl_f = None
+        _is_ooc = pd.Series(False, index=_chart_data_df.index)
+        if _ucl_f is not None:
+            _is_ooc = _is_ooc | (_chart_data_df["point_val"] > _ucl_f)
+        if _lcl_f is not None:
+            _is_ooc = _is_ooc | (_chart_data_df["point_val"] < _lcl_f)
+        _chart_data_df["is_ooc"] = _is_ooc
+        # 標記 cpk < 1.33
+        if "cpk" in _chart_data_df.columns:
+            _cpk_numeric = pd.to_numeric(_chart_data_df["cpk"], errors="coerce")
+            _chart_data_df["cpk_lt_133"] = _weekly_mask & (_cpk_numeric < 1.33)
+        else:
+            _chart_data_df["cpk_lt_133"] = False
         # 確保所有值都是 Python 原生型別（避免 numpy 型別造成 JSON 序列化問題）
         result["chart_data"] = [
             {k: (float(v) if hasattr(v, "item") else (bool(v) if isinstance(v, (bool, np.bool_)) else v)) for k, v in row.items()}
             for row in _chart_data_df.to_dict(orient="records")
         ]
+        # 計算 cpk_below_133_cnt（只統計當週 window 內 cpk < 1.33 的 row 數）
+        if "cpk" in _plot_df.columns:
+            _weekly_cpk_df = _plot_df[
+                (_plot_df["point_time"] >= weekly_start_date) & (_plot_df["point_time"] <= weekly_end_date)
+            ].copy()
+            _cpk_all = pd.to_numeric(_weekly_cpk_df["cpk"], errors="coerce")
+            result["cpk_below_133_cnt"] = int((_cpk_all < 1.33).sum())
+        else:
+            result["cpk_below_133_cnt"] = 0
     except Exception:
         result["chart_data"] = []
+        result["cpk_below_133_cnt"] = 0
 
     # 計算 weekly OOS 計數（weekly 窗口內出現於完整資料但被 OOS 過濾掉的點）
     try:
@@ -1248,22 +1449,33 @@ def split_csvs(req: SplitRequest) -> Dict[str, Any]:
 
     successes = 0
     failures: List[str] = []
+    unified_result: Optional[dict] = None
     for path in req.input_files:
         ok = False
         if req.mode == "Type3_Horizontal": ok = _split_type3_horizontal(path, final_output_folder)
         elif req.mode == "Type2_Vertical": ok = _split_type2_vertical(path, final_output_folder)
         elif req.mode == "Vendor_Vertical": ok = _split_vendor_vertical(path, final_output_folder)
         elif req.mode == "Test_Horizontal": ok = _split_test_horizontal(path, final_output_folder)
+        elif req.mode == "Unified_Vertical":
+            res = _split_unified_vertical(path, final_output_folder)
+            ok = res.get("ok", False)
+            if ok and unified_result is None:
+                unified_result = res  # 保留第一個成功結果的額外路徑
         if ok: successes += 1
         else: failures.append(os.path.basename(path))
 
-    return {
+    resp: Dict[str, Any] = {
         "mode": req.mode,
         "split_id": split_id,
         "raw_data_directory": os.path.abspath(final_output_folder),
         "processed": successes,
         "failed": failures,
     }
+    if unified_result:
+        resp["allchartinfo_path"] = unified_result["allchartinfo_path"]
+        resp["oob_dir"] = unified_result["oob_dir"]
+        resp["cpk_dir"] = unified_result["cpk_dir"]
+    return resp
 
 @app.get("/split-status")
 def get_split_status(split_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1522,13 +1734,37 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
             if "Characteristics" in r: r["Characteristics"] = str(r["Characteristics"]) if r["Characteristics"] is not None else None
             result_items.append(ResultItem(**r))
 
+        # 聚合 per-row 明細（只保留有 OOC / OOS / cpk<1.33 違規的 rows）
+        row_level_details: List[Dict[str, Any]] = []
+        for r in results:
+            _gname = r.get("group_name", "")
+            _cname = r.get("chart_name", "")
+            _oob_rule = r.get("OOB_Rule", "") or ""
+            for _row in (r.get("chart_data") or []):
+                _is_ooc = bool(_row.get("is_ooc", False))
+                _is_oos = bool(_row.get("is_oos", False))
+                _cpk_lt = bool(_row.get("cpk_lt_133", False))
+                if _is_ooc or _is_oos or _cpk_lt:
+                    row_level_details.append({
+                        "group_name":    _gname,
+                        "chart_name":    _cname,
+                        "Batch_ID":      _row.get("Batch_ID", ""),
+                        "point_time":    _row.get("point_time", ""),
+                        "point_val":     _row.get("point_val"),
+                        "OOC":           _is_ooc,
+                        "OOS":           _is_oos,
+                        "cpk":           _row.get("cpk"),
+                        "cpk_lt_133":    _cpk_lt,
+                        "chart_oob_rule": _oob_rule,
+                    })
+
         # 將完整結果序列化寫入 JSON 檔（不走 Manager.dict，避免大量資料反序列化耗 CPU）
         # Atomic write：先寫 .tmp 再 rename，防止 watchdog kill 到一半產生損壞 JSON
         _result_file = _result_json_path(task_id)
         os.makedirs(os.path.dirname(_result_file), exist_ok=True)
         _result_tmp = _result_file + ".tmp"
         with open(_result_tmp, "w", encoding="utf-8") as _f:
-            json.dump(ProcessResponse(summary=summary, results=result_items).model_dump(), _f, ensure_ascii=False, default=str)
+            json.dump(ProcessResponse(summary=summary, results=result_items, row_level_details=row_level_details).model_dump(), _f, ensure_ascii=False, default=str)
         os.replace(_result_tmp, _result_file)
 
         _upd({

@@ -1,0 +1,115 @@
+{
+  "aliases": {
+    "group_name": [
+      "GroupName",
+      "GroupNar",
+      "group_name",
+      "group",
+      "gname",
+      "Part ID",
+      "part_id",
+      "part id"
+    ],
+    "chart_name": [
+      "ChartName",
+      "ChartNam",
+      "chart_name",
+      "chart",
+      "cname",
+      "Item Name",
+      "item_name",
+      "item name"
+    ],
+    "usl": [
+      "USL",
+      "usl"
+    ],
+    "lsl": [
+      "LSL",
+      "lsl"
+    ],
+    "ucl": [
+      "UCL",
+      "ucl"
+    ],
+    "lcl": [
+      "LCL",
+      "lcl"
+    ],
+    "target": [
+      "Target",
+      "target"
+    ],
+    "std": [
+      "Std",
+      "std"
+    ],
+    "cpk": [
+      "cpk",
+      "Cpk",
+      "CPK"
+    ],
+    "mean": [
+      "Mean",
+      "mean",
+      "Lot Mean",
+      "Lot Mean Valid",
+      "lot mean",
+      "lot mean valid"
+    ],
+    "point_val": [
+      "point_val",
+      "Point Value",
+      "value",
+      "Mean",
+      "Lot Mean",
+      "Lot Mean Valid",
+      "lot mean",
+      "lot mean valid"
+    ],
+    "point_time": [
+      "point_time",
+      "Point Time",
+      "time",
+      "datetime",
+      "Report Time",
+      "FT Test End Time",
+      "report time",
+      "ft test end time"
+    ],
+    "batch_id": [
+      "Batch_ID",
+      "batch_id",
+      "Batch ID",
+      "batch id",
+      "lot",
+      "lot_id",
+      "lot id"
+    ],
+    "matching": [
+      "Matching",
+      "Vendor Site",
+      "Test Site",
+      "vendor site",
+      "test site",
+      "site",
+      "tool",
+      "tool_name"
+    ],
+    "material_no": [
+      "Material_no",
+      "material_no",
+      "material no",
+      "Material No"
+    ],
+    "chart_id": [
+      "ChartID",
+      "chart_id",
+      "chart id",
+      "Chart Id"
+    ]
+  },
+  "site_column_patterns": [
+    "^[Ss][Ii][Tt][Ee]_?\\d+$"
+  ]
+}

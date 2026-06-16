@@ -316,6 +316,23 @@ def generate_test_charts():
             'Batch_ID': batch_ids,
             'Matching': tools_col  # 新增的機台欄位
         })
+
+        # --- 計算 per-row cpk（使用滑動視窗 std 估算過程能力）---
+        _win = min(20, max(5, len(data) // 10))
+        _vals_s = pd.Series(data)
+        _rolling_std = _vals_s.rolling(window=_win, min_periods=3).std().bfill()
+        _rolling_std = _rolling_std.replace(0, np.nan)
+        _usl = chart_info.get('USL')
+        _lsl = chart_info.get('LSL')
+        def _cpk(pv, rs):
+            if rs is None or (isinstance(rs, float) and np.isnan(rs)) or rs <= 0:
+                return None
+            cpu = ((_usl - pv) / (3 * rs)) if _usl is not None else None
+            cpl = ((pv - _lsl) / (3 * rs)) if _lsl is not None else None
+            if cpu is not None and cpl is not None:
+                return round(min(cpu, cpl), 4)
+            return round(cpu, 4) if cpu is not None else (round(cpl, 4) if cpl is not None else None)
+        csv_data['cpk'] = [_cpk(pv, rs) for pv, rs in zip(data, _rolling_std)]
         # -----------------------
         
         os.makedirs('input/raw_charts', exist_ok=True)

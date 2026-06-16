@@ -241,7 +241,8 @@ def preprocess_data(chart_info, raw_df):
 
         # OOS 過濾前保存完整資料供繪圖使用（含 OOS 點以便在圖上標記）
         tool_cols_pre = [c for c in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id'] if c in raw_df.columns]
-        full_df = raw_df[['point_val', 'point_time'] + tool_cols_pre].copy()
+        extra_cols_pre = [c for c in ['Batch_ID', 'cpk'] if c in raw_df.columns]
+        full_df = raw_df[['point_val', 'point_time'] + tool_cols_pre + extra_cols_pre].copy()
 
         raw_df = exclude_oos_data(raw_df)
         # 保留機台欄位以供後續 by-tool 繪圖使用
