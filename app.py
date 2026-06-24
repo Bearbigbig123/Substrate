@@ -458,7 +458,7 @@ def _local_split_unified_file(input_path: str) -> dict:
     os.makedirs(oob_dir, exist_ok=True)
 
     id_base = ["GroupName", "ChartName"]
-    optional_id = ["point_time", "Batch_ID"]
+    optional_id = ["point_time", "Batch_ID", "cpk"]
     oob_id_cols = id_base + [c for c in optional_id if c in df.columns]
 
     def _sanitize(name: str) -> str:

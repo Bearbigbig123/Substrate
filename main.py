@@ -653,7 +653,7 @@ def _split_unified_vertical(input_path: str, base_out_dir: str) -> dict:
         os.makedirs(oob_dir, exist_ok=True)
 
         id_base = ["GroupName", "ChartName"]
-        optional_id = ["point_time", "Batch_ID"]
+        optional_id = ["point_time", "Batch_ID", "cpk"]
         oob_id_cols = id_base + [c for c in optional_id if c in df.columns]
 
         uniq = df[["GroupName", "ChartName"]].drop_duplicates()
