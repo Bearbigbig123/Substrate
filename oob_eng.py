@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import logging
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -68,6 +69,16 @@ except Exception:
     class ImageQt: ...
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial Unicode MS', 'Noto Sans CJK TC']
 plt.rcParams['axes.unicode_minus'] = False  # 正確顯示負號
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
+
+def _is_finite_number(value) -> bool:
+    try:
+        return value is not None and pd.notna(value) and np.isfinite(float(value))
+    except Exception:
+        return False
 
 
 def load_execution_time(raw_data_file):
@@ -180,8 +191,7 @@ def format_and_clean_data(raw_df, chart_info):
     raw_df['point_time'] = pd.to_datetime(
         raw_df['point_time'], 
         format='%Y/%m/%d %H:%M', 
-        errors='coerce',
-        infer_datetime_format=True  # 加速轉換
+        errors='coerce'
     )
     
     raw_df.dropna(subset=['point_val', 'point_time'], inplace=True)
@@ -328,11 +338,14 @@ def record_high_low_calculator(current_week_data, historical_data):
         current_week_data = np.asarray(current_week_data)
         historical_data = np.asarray(historical_data)
         
-        # DEBUG: 輸出數據詳細信息
-        print(f"  DEBUG: 當週數據點數={len(current_week_data)}, 基線數據點數={len(historical_data)}")
-        print(f"  DEBUG: 當週數據前5個值={current_week_data[:5] if len(current_week_data) >= 5 else current_week_data}")
-        print(f"  DEBUG: 基線數據前5個值={historical_data[:5] if len(historical_data) >= 5 else historical_data}")
-        print(f"  DEBUG: 基線數據後5個值={historical_data[-5:] if len(historical_data) >= 5 else historical_data}")
+        logger.debug(
+            "record_high_low inputs | weekly_cnt=%s baseline_cnt=%s weekly_head=%s baseline_head=%s baseline_tail=%s",
+            len(current_week_data),
+            len(historical_data),
+            current_week_data[:5] if len(current_week_data) >= 5 else current_week_data,
+            historical_data[:5] if len(historical_data) >= 5 else historical_data,
+            historical_data[-5:] if len(historical_data) >= 5 else historical_data,
+        )
         
         # 計算當週最高值和最低值 - 使用numpy的快速操作
         current_max = np.max(current_week_data)
@@ -342,17 +355,24 @@ def record_high_low_calculator(current_week_data, historical_data):
         historical_max = np.max(historical_data)
         historical_min = np.min(historical_data)
         
-        # DEBUG: 輸出詳細比較信息
-        print(f"  DEBUG: 當週最高值={current_max:.8f}, 歷史最高值={historical_max:.8f}")
-        print(f"  DEBUG: 當週最低值={current_min:.8f}, 歷史最低值={historical_min:.8f}")
-        print(f"  DEBUG: 最高值差異={current_max - historical_max:.8f}")
-        print(f"  DEBUG: 最低值差異={current_min - historical_min:.8f}")
+        logger.debug(
+            "record_high_low extrema | current_max=%.8f historical_max=%.8f current_min=%.8f historical_min=%.8f diff_max=%.8f diff_min=%.8f",
+            current_max,
+            historical_max,
+            current_min,
+            historical_min,
+            current_max - historical_max,
+            current_min - historical_min,
+        )
         
         # 檢查當週數據是否包含歷史極值
         current_has_hist_max = np.any(current_week_data == historical_max)
         current_has_hist_min = np.any(current_week_data == historical_min)
-        print(f"  DEBUG: 當週數據是否包含歷史最高值={current_has_hist_max}")
-        print(f"  DEBUG: 當週數據是否包含歷史最低值={current_has_hist_min}")
+        logger.debug(
+            "record_high_low contains_hist | has_hist_max=%s has_hist_min=%s",
+            current_has_hist_max,
+            current_has_hist_min,
+        )
         
         # 判斷是否創下新高或新低 - 簡單的數值比較，非常快速
         record_high = current_max > historical_max
@@ -361,9 +381,16 @@ def record_high_low_calculator(current_week_data, historical_data):
         # 如果創下新高或新低，則需要高亮顯示
         highlight_status = 'HIGHLIGHT' if (record_high or record_low) else 'NO_HIGHLIGHT'
         
-        print(f"  record_high_low_calculator: 當週最高={current_max:.4f}, 歷史最高={historical_max:.4f}, 創新高={record_high}")
-        print(f"  record_high_low_calculator: 當週最低={current_min:.4f}, 歷史最低={historical_min:.4f}, 創新低={record_low}")
-        print(f"  record_high_low_calculator: 高亮狀態={highlight_status}")
+        logger.debug(
+            "record_high_low result | current_max=%.4f historical_max=%.4f record_high=%s current_min=%.4f historical_min=%.4f record_low=%s highlight=%s",
+            current_max,
+            historical_max,
+            record_high,
+            current_min,
+            historical_min,
+            record_low,
+            highlight_status,
+        )
         
         return {
             'record_high': record_high,
@@ -371,8 +398,8 @@ def record_high_low_calculator(current_week_data, historical_data):
             'highlight_status': highlight_status
         }
         
-    except Exception as e:
-        print(f"  record_high_low_calculator: Error occurred during calculation: {e}")
+    except Exception:
+        logger.exception("record_high_low_calculator failed")
         return {
             'record_high': False,
             'record_low': False,
@@ -485,6 +512,7 @@ def kshift_sigma_ratio_calculator(base, data, characteristic, resolution, ucl, l
     處理週數據點數為 1 時的滾動計算和數據填充。
     加入安全除法避免標準差為零導致的問題。
     """
+    print = logger.debug  # route verbose hot-path output through debug logging
     results = {
         'P95_k': np.nan,
         'P50_k': np.nan,
@@ -776,7 +804,8 @@ def determine_data_type(data_values):
     - 'discrete' 或 'continuous'
     """
     import numpy as np
-    
+    print = logger.debug  # route verbose hot-path output through debug logging
+
     # 移除 NaN 值
     clean_values = data_values.dropna() if hasattr(data_values, 'dropna') else data_values[~np.isnan(data_values)]
     
@@ -959,6 +988,7 @@ def discrete_oob_calculator(base_data, weekly_data, chart_info, raw_df=None,
     - dict: 包含 OOB 結果的字典
     """
     import numpy as np
+    print = logger.debug  # route verbose hot-path output through debug logging
     
     print(f"  離散型 OOB 計算: 基線數據點數={base_data['cnt']}, 週數據點數={weekly_data['cnt']}")
     
@@ -1022,10 +1052,8 @@ def discrete_oob_calculator(base_data, weekly_data, chart_info, raw_df=None,
         
         print(f"  離散型 OOB 計算完成: {results}")
         
-    except Exception as e:
-        print(f"  離散型 OOB 計算錯誤: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("discrete_oob_calculator failed")
     
     return results
 
@@ -1130,7 +1158,8 @@ def discrete_kshift_calculator(base_data, weekly_data, characteristic, resolutio
     Capping rule: 如果當周點數<=10 且 當周P95/P50/P05沒有超過 baseline的P05和P95範圍外，就不HL
     """
     import numpy as np
-    
+    print = logger.debug  # route verbose hot-path output through debug logging
+
     print("  discrete_kshift: 開始計算離散型 K-shift")
     
     # 先使用原本的 kshift_sigma_ratio_calculator 獲取結果
@@ -1209,7 +1238,8 @@ def category_lt_shift_calculator(base_data, weekly_data, threshold=0.7):
     """
     import numpy as np
     import pandas as pd
-    
+    print = logger.debug  # route verbose hot-path output through debug logging
+
     print("  category_LT_shift: 開始計算")
     
     result = {
@@ -1273,16 +1303,15 @@ def category_lt_shift_calculator(base_data, weekly_data, threshold=0.7):
             result['highlight_status'] = 'NO_HIGHLIGHT' 
             print(f"  category_LT_shift: 比例差異 {ratio_diff:.3f} <= {threshold}，NO_HIGHLIGHT")
             
-    except Exception as e:
-        print(f"  category_LT_shift: 計算時發生錯誤: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("category_lt_shift_calculator failed")
         result['highlight_status'] = 'NO_HIGHLIGHT'
     
     return result
 
 
 def process_single_chart(chart_info, raw_df, initial_baseline_start_date, baseline_end_date, weekly_start_date, weekly_end_date):
+    print = logger.debug  # route verbose hot-path output through debug logging
     print("--- 進入外部 process_single_chart 函數 ---")
     print(f"  接收到的 raw_df shape: {raw_df.shape}")
     print(f"  週數據範圍: {weekly_start_date} 至 {weekly_end_date}")
@@ -1485,10 +1514,12 @@ def process_single_chart(chart_info, raw_df, initial_baseline_start_date, baseli
         print("--- 外部 process_single_chart 函數成功退出 ---")
         return result
 
-    except Exception as e:
-        # 在外部函數中捕獲異常並印出 traceback
-        print(f'處理圖表時出錯 (外部函數) {chart_info.get("group_name", "N/A")} - {chart_info.get("chart_name", "N/A")}: {e}')
-        traceback.print_exc()
+    except Exception:
+        logger.exception(
+            "process_single_chart failed | group=%s chart=%s",
+            chart_info.get("group_name", "N/A"),
+            chart_info.get("chart_name", "N/A"),
+        )
         return None
 
 def calculate_sigma(UCL, LCL, mean):
@@ -1628,20 +1659,22 @@ def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug
     raw_df = raw_df.sort_values('point_time').reset_index(drop=True)
 
     # === 使用全部數據，無點數限制 ===
-    print(f"  plot_spc_chart: 使用全部數據點數 {len(raw_df)}")
+    logger.debug("plot_spc_chart points=%s", len(raw_df))
     original_length = len(raw_df)
 
     points_num = len(raw_df)
     x_values = np.arange(points_num)
 
     # === 控制線 ===
-    plt.hlines(chart_info['UCL'], -0.8, points_num + 2, colors='#E83F6F', linestyles='--', linewidth=1)
-    plt.hlines(chart_info['Target'], -0.8, points_num + 2, colors='#087E8B', linestyles='--', linewidth=1)
-    plt.hlines(chart_info['LCL'], -0.8, points_num + 2, colors='#E83F6F', linestyles='--', linewidth=1)
-
-    plt.text(x=points_num + 2, y=chart_info['UCL'], s='UCL', va='center', ha='left', fontsize=10, color='#E83F6F')
-    plt.text(x=points_num + 2, y=chart_info['Target'], s='Target', va='center', ha='left', fontsize=10, color='#087E8B')
-    plt.text(x=points_num + 2, y=chart_info['LCL'], s='LCL', va='center', ha='left', fontsize=10, color='#E83F6F')
+    for y_val, text, color in [
+        (chart_info.get('UCL'), 'UCL', '#E83F6F'),
+        (chart_info.get('Target'), 'Target', '#087E8B'),
+        (chart_info.get('LCL'), 'LCL', '#E83F6F'),
+    ]:
+        if _is_finite_number(y_val):
+            y_num = float(y_val)
+            plt.hlines(y_num, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+            plt.text(x=points_num + 2, y=y_num, s=text, va='center', ha='left', fontsize=10, color=color)
 
     # === 畫數據線 ===
     plt.plot(x_values, raw_df['point_val'], color='#5863F8', marker='o', linestyle='-')
@@ -1666,9 +1699,9 @@ def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug
     end_index   = raw_df[raw_df['point_time'] <= we].index.max()
 
     if debug:
-        print(f"[DEBUG] weekly_start_date={ws}, weekly_end_date={we}")
-        print(f"[DEBUG] start_index={start_index}, time={raw_df.loc[start_index,'point_time']}")
-        print(f"[DEBUG] end_index={end_index}, time={raw_df.loc[end_index,'point_time']}")
+        logger.debug("plot_spc_chart window | weekly_start=%s weekly_end=%s", ws, we)
+        logger.debug("plot_spc_chart indices | start_index=%s time=%s", start_index, raw_df.loc[start_index, 'point_time'])
+        logger.debug("plot_spc_chart indices | end_index=%s time=%s", end_index, raw_df.loc[end_index, 'point_time'])
 
     # === 檢查 rule，標紅點 ===
     violated_rules = {rule: False for rule in chart_info.get('rule_list', [])}
@@ -1762,12 +1795,15 @@ def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date
     plt.title(title, loc='left', fontsize=12)
 
     # 繪製控制線（使用 weekly 範圍作為長度參考）
-    plt.hlines(chart_info['UCL'], -0.8, points_num + 2, colors='#E83F6F', linestyles='--', linewidth=1)
-    plt.hlines(chart_info['Target'], -0.8, points_num + 2, colors='#087E8B', linestyles='--', linewidth=1)
-    plt.hlines(chart_info['LCL'], -0.8, points_num + 2, colors='#E83F6F', linestyles='--', linewidth=1)
-    plt.text(x=points_num + 2, y=chart_info['UCL'], s='UCL', va='center', ha='left', fontsize=10, color='#E83F6F')
-    plt.text(x=points_num + 2, y=chart_info['Target'], s='Target', va='center', ha='left', fontsize=10, color='#087E8B')
-    plt.text(x=points_num + 2, y=chart_info['LCL'], s='LCL', va='center', ha='left', fontsize=10, color='#E83F6F')
+    for y_val, text, color in [
+        (chart_info.get('UCL'), 'UCL', '#E83F6F'),
+        (chart_info.get('Target'), 'Target', '#087E8B'),
+        (chart_info.get('LCL'), 'LCL', '#E83F6F'),
+    ]:
+        if _is_finite_number(y_val):
+            y_num = float(y_val)
+            plt.hlines(y_num, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+            plt.text(x=points_num + 2, y=y_num, s=text, va='center', ha='left', fontsize=10, color=color)
 
     # 畫 weekly 的折線（x 軸使用 0..N-1）
     plt.plot(x_values, df_weekly['point_val'].values, color='#5863F8', marker='o', linestyle='-')
@@ -1797,8 +1833,14 @@ def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date
             plt.plot(pos_in_weekly, row['point_val'], 'ro', markersize=10)
             violated_points.append((pos_in_weekly, global_idx, row['point_time'], row['point_val'], rules))
             if debug:
-                print(f'[VIOL] weekly_pos={pos_in_weekly} global_idx={global_idx} time={row["point_time"]} '
-                      f'value={row["point_val"]} rules={ {k:v for k,v in rules.items() if v} }')
+                logger.debug(
+                    "plot_weekly_spc violation | weekly_pos=%s global_idx=%s time=%s value=%s rules=%s",
+                    pos_in_weekly,
+                    global_idx,
+                    row["point_time"],
+                    row["point_val"],
+                    {k: v for k, v in rules.items() if v},
+                )
 
     # X axis labels
     interval = max(1, points_num // 30)
@@ -1925,8 +1967,8 @@ def add_right_cl_labels(ax, chart_info, x_pos=None):
         (chart_info.get('LCL'), 'LCL', '#E83F6F'),
     ]
     for y_val, text, color in labels:
-        if y_val is not None and pd.notna(y_val):
-            ax.text(x_pos, y_val, text, va='center', ha='left',
+        if _is_finite_number(y_val):
+            ax.text(x_pos, float(y_val), text, va='center', ha='left',
                     fontsize=10, color=color, fontweight='bold',
                     transform=ax.get_yaxis_transform())
 
@@ -1986,8 +2028,8 @@ def plot_spc_chart_interactive(raw_df, chart_info, weekly_start_date, weekly_end
     for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
                           (chart_info.get('Target'), '#087E8B'),
                           (chart_info.get('LCL'), '#E83F6F')]:
-        if y_val is not None and pd.notna(y_val):
-            ax.hlines(y_val, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+        if _is_finite_number(y_val):
+            ax.hlines(float(y_val), -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
     add_right_cl_labels(ax, chart_info)
 
     # 背景底色
@@ -2097,8 +2139,8 @@ def plot_spc_by_tool_color(raw_df, chart_info, weekly_start_date, weekly_end_dat
     for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
                           (chart_info.get('Target'), '#087E8B'),
                           (chart_info.get('LCL'), '#E83F6F')]:
-        if y_val is not None and pd.notna(y_val):
-            ax.hlines(y_val, -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
+        if _is_finite_number(y_val):
+            ax.hlines(float(y_val), -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
     add_right_cl_labels(ax, chart_info)
 
     # X 軸：顯示 point_time 日期，採樣間隔避免標籤重疊
@@ -2177,8 +2219,8 @@ def plot_spc_by_tool_group(raw_df, chart_info, oob_info="N/A", output_dir: str =
     for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
                           (chart_info.get('Target'), '#087E8B'),
                           (chart_info.get('LCL'), '#E83F6F')]:
-        if y_val is not None and pd.notna(y_val):
-            ax.hlines(y_val, -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
+        if _is_finite_number(y_val):
+            ax.hlines(float(y_val), -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
     add_right_cl_labels(ax, chart_info)
 
     # X 軸：顯示 point_time 日期，採樣間隔避免標籤重疊
@@ -2258,8 +2300,8 @@ def plot_weekly_spc_chart_interactive(raw_df, chart_info, weekly_start_date, wee
     for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
                           (chart_info.get('Target'), '#087E8B'),
                           (chart_info.get('LCL'), '#E83F6F')]:
-        if y_val is not None and pd.notna(y_val):
-            ax.hlines(y_val, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+        if _is_finite_number(y_val):
+            ax.hlines(float(y_val), -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
     add_right_cl_labels(ax, chart_info)
 
     # 週資料底色（全紅）
@@ -2306,6 +2348,14 @@ def plot_weekly_spc_chart_interactive(raw_df, chart_info, weekly_start_date, wee
 
 
 def save_results_to_excel(results_df, scale_factor=0.3, output_path: str = 'result_with_images.xlsx'):
+    def _valid_image_path(path_value):
+        if path_value is None:
+            return None
+        path_str = str(path_value).strip()
+        if not path_str or path_str.upper() in {"N/A", "NAN", "NONE", "<NA>"}:
+            return None
+        return path_str if os.path.isfile(path_str) else None
+
     results_df['group_name'] = results_df['group_name'].replace("Default", "")  # 替換 Default 為空白
 
     workbook = xlsxwriter.Workbook(output_path)
@@ -2324,8 +2374,8 @@ def save_results_to_excel(results_df, scale_factor=0.3, output_path: str = 'resu
     image_column_width = 0
 
     for row_idx, row in enumerate(results_df.itertuples(index=False), start=1):
-        img_path = row.chart_path
-        weekly_spc_chart_path = row.weekly_chart_path
+        img_path = _valid_image_path(row.chart_path)
+        weekly_spc_chart_path = _valid_image_path(row.weekly_chart_path)
 
         x_offset = 0
         y_offset = 10
@@ -2337,18 +2387,19 @@ def save_results_to_excel(results_df, scale_factor=0.3, output_path: str = 'resu
             'object_position': 1
         }
 
-        worksheet.insert_image(row_idx, 0, img_path, options)
-        worksheet.insert_image(row_idx, 1, weekly_spc_chart_path, options)
+        for image_col, valid_path in ((0, img_path), (1, weekly_spc_chart_path)):
+            if not valid_path:
+                continue
+            worksheet.insert_image(row_idx, image_col, valid_path, options)
+            with Image.open(valid_path) as img:
+                image_width, image_height = img.size
+            scaled_width = image_width * scale_factor
+            scaled_height = image_height * scale_factor
 
-        img = Image.open(img_path)
-        image_width, image_height = img.size
-        scaled_width = image_width * scale_factor
-        scaled_height = image_height * scale_factor
-
-        if scaled_height > max_image_height:
-            max_image_height = scaled_height
-        if scaled_width > image_column_width:
-            image_column_width = scaled_width
+            if scaled_height > max_image_height:
+                max_image_height = scaled_height
+            if scaled_width > image_column_width:
+                image_column_width = scaled_width
 
         for col_idx, value in enumerate(row, start=1):
             worksheet.write(row_idx, col_idx + 1, value, cell_format)
@@ -3090,7 +3141,7 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
                             print(f" - 使用快取的數據類型: {data_type}")
 
                             if 'point_time' in raw_df.columns:
-                                raw_df['point_time'] = pd.to_datetime(raw_df['point_time'], errors='coerce', infer_datetime_format=True)
+                                raw_df['point_time'] = pd.to_datetime(raw_df['point_time'], errors='coerce')
                                 raw_df.dropna(subset=['point_time'], inplace=True)
 
                             is_successful, processed_df, updated_chart_info, _full_df = preprocess_data(chart_info, raw_df)

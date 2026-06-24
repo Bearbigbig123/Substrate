@@ -16,6 +16,8 @@ import uuid
 import asyncio
 import threading
 import json
+import concurrent.futures
+import logging
 from datetime import datetime, date, timedelta
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Union
@@ -100,6 +102,8 @@ import cpk_eng
 # 主進程的任務狀態字典，由 lifespan 初始化為 Manager().dict()
 # 此處先為 plain dict 佔位，避免子進程 import 時意外觸發 Manager()
 task_status_db: Dict[str, Any] = {}
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
 def update_task_status(task_id: str, updates: dict, db=None):
     """跨進程安全更新狀態的幫手函數，解決 Manager.dict 的巢狀更新問題。
@@ -114,11 +118,42 @@ def update_task_status(task_id: str, updates: dict, db=None):
 _TASK_TTL_HOURS = 24
 # Processing 狀態超過此時間視為卡死，watchdog 會強制 kill (2 小時)
 _TASK_PROCESSING_TIMEOUT_HOURS = 2
+_OOB_PROCESS_MAX_WORKERS = min(os.cpu_count() or 1, 8)
 
 
 def _result_json_path(task_id: str) -> str:
     """返回此 task 的結果 JSON 檔案絕對路徑（寫入子進程、讀取主進程）。"""
     return os.path.abspath(os.path.join("output", task_id, "result.json"))
+
+
+def _build_chart_csv_index(raw_dir: str, expected_pairs: List[tuple[str, str]]) -> Dict[tuple[str, str], str]:
+    """Build a one-pass filename index for chart CSV lookup."""
+    try:
+        filenames = [name for name in os.listdir(raw_dir) if name.lower().endswith(".csv")]
+    except Exception:
+        return {}
+
+    exact_map = {name: os.path.join(raw_dir, name) for name in filenames}
+    available_names = set(filenames)
+    indexed: Dict[tuple[str, str], str] = {}
+
+    for group_name, chart_name in expected_pairs:
+        exact_name = f"{group_name}_{chart_name}.csv"
+        if exact_name in available_names:
+            indexed[(group_name, chart_name)] = exact_map[exact_name]
+            continue
+
+        prefix = f"{group_name}_{chart_name}_"
+        for filename in filenames:
+            if not filename.startswith(prefix):
+                continue
+            suffix = filename[len(prefix):-4]
+            parts = suffix.split("_")
+            if len(parts) == 2 and all(part.isdigit() for part in parts):
+                indexed[(group_name, chart_name)] = exact_map[filename]
+                break
+
+    return indexed
 
 
 async def _cleanup_expired_tasks() -> None:
@@ -938,10 +973,8 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
     cpk = calculate_cpk(weekly_data, chart_info)
     result["Cpk"] = cpk.get("Cpk", np.nan) if cpk else np.nan
 
-    try:
-        qq_plot_path = plot_qq_plot(_plot_df, chart_info, output_dir=output_dir)
-    except Exception:
-        qq_plot_path = None
+    # Q-Q plot is expensive at high chart counts; keep the response field but skip generation.
+    qq_plot_path = None
 
     # 序列化 chart_data 供 UI Plotly hover 使用 (All Data SPC，含 OOS 點)
     result["weekly_start"] = str(weekly_start_date)
@@ -1579,18 +1612,22 @@ def _spc_cpk_worker(args):
             'mean_last2_month': san(mean_stats.get('mean_last2_month')), 'sigma_last2_month': san(mean_stats.get('sigma_last2_month')),
             'mean_all': san(mean_stats.get('mean_all')), 'sigma_all': san(mean_stats.get('sigma_all')),
         }
-    except Exception as e:
-        print(f"[_spc_cpk_worker] Error {chart_info_dict.get('GroupName')}/{chart_info_dict.get('ChartName')}: {e}")
+    except Exception:
+        logger.exception(
+            "_spc_cpk_worker failed | group=%s chart=%s",
+            chart_info_dict.get('GroupName'),
+            chart_info_dict.get('ChartName'),
+        )
         return None
 
 
 def _process_single_chart_worker(args):
     """
     頂層 picklable worker，供 ProcessPoolExecutor 使用。
-    args: (chart_info_row_dict, exec_time, raw_dir, task_output_dir)
+    args: (chart_info_row_dict, exec_time, csv_path, task_output_dir)
     回傳分析結果 dict，若失敗或跳過則回傳 None。
     """
-    chart_info_row_dict, exec_time, raw_dir, task_output_dir = args
+    chart_info_row_dict, exec_time, csv_path, task_output_dir = args
     try:
         import pandas as pd
         group_name = str(chart_info_row_dict.get("GroupName", chart_info_row_dict.get("group_name", "Unknown")))
@@ -1605,7 +1642,6 @@ def _process_single_chart_worker(args):
             "no_data": True,
         }
 
-        csv_path = find_matching_file(raw_dir, group_name, chart_name)
         if not csv_path or not os.path.exists(csv_path):
             return {**_minimal, "no_data_reason": "csv_not_found"}
 
@@ -1677,23 +1713,47 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
         task_output_dir = os.path.abspath(os.path.join("output", task_id))
         os.makedirs(task_output_dir, exist_ok=True)
 
+        expected_pairs = [
+            (
+                str(row.get("GroupName", row.get("group_name", "Unknown"))),
+                str(row.get("ChartName", row.get("chart_name", "Unknown"))),
+            )
+            for _, row in all_charts_info.iterrows()
+        ]
+        chart_csv_index = _build_chart_csv_index(raw_dir, expected_pairs)
+
         # 封裝每張圖的參數為可 pickle 的 tuple list
         _upd({"progress": 20})
         task_args = [
-            (row.to_dict(), exec_time, raw_dir, task_output_dir)
+            (
+                row.to_dict(),
+                exec_time,
+                chart_csv_index.get(
+                    (
+                        str(row.get("GroupName", row.get("group_name", "Unknown"))),
+                        str(row.get("ChartName", row.get("chart_name", "Unknown"))),
+                    )
+                ),
+                task_output_dir,
+            )
             for _, row in all_charts_info.iterrows()
         ]
 
-        # 序列執行（已停用平行運算）
-        # import concurrent.futures
-        # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-        #     for result in executor.map(_process_single_chart_worker, task_args):
-        #         processed_results.append(result)
-        processed_results = []
+        processed_results: List[Optional[Dict[str, Any]]] = [None] * len(task_args)
         _total_tasks = len(task_args)
-        for _i, result in enumerate(map(_process_single_chart_worker, task_args)):
-            processed_results.append(result)
-            _upd({"progress": 20 + int(70 * (_i + 1) / max(_total_tasks, 1))})
+        max_workers = min(_OOB_PROCESS_MAX_WORKERS, max(_total_tasks, 1))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_process_single_chart_worker, args): idx
+                for idx, args in enumerate(task_args)
+            }
+            for _i, future in enumerate(concurrent.futures.as_completed(future_map), start=1):
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+                processed_results[future_map[future]] = result
+                _upd({"progress": 20 + int(70 * _i / max(_total_tasks, 1))})
 
         results: List[Dict[str, Any]] = [r for r in processed_results if r is not None]
         skipped = len(processed_results) - len(results)
